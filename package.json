@@ -1,0 +1,76 @@
+{
+  "name": "@codegrammer/co-od",
+  "version": "0.2.0",
+  "description": "Open-source CLI for running coding agents together in co-od rooms",
+  "packageManager": "pnpm@9.12.0",
+  "type": "module",
+  "bin": {
+    "co-ode": "dist/index.js",
+    "co-od": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "SKILL.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -w -p tsconfig.json",
+    "test": "corepack pnpm run build && node --test test/*.mjs",
+    "doctor": "node dist/index.js doctor",
+    "doctor:strict": "node dist/index.js doctor --strict",
+    "qa:tui": "node dist/index.js tui-qa",
+    "qa:tui:experience": "corepack pnpm run build && node scripts/tui-experience-snapshots.mjs",
+    "qa:tui:live": "node dist/index.js tui-qa --live",
+    "qa:tui:live:mutate": "node dist/index.js tui-qa --live --mutate",
+    "smoke:tui": "node dist/index.js tui --smoke-test --duration-ms 100 --startup-budget-ms 1000",
+    "smoke:opentui": "node dist/index.js opentui --smoke-test --duration-ms 100 --startup-budget-ms 1000",
+    "smoke:tui:opentui": "node dist/index.js tui --renderer opentui --smoke-test --duration-ms 100 --startup-budget-ms 1000",
+    "smoke:chat": "node dist/index.js opentui --view chat --smoke-test --duration-ms 100 --startup-budget-ms 1000",
+    "smoke:packaged": "node scripts/smoke-packaged-install.mjs",
+    "smoke:fresh-install": "node scripts/smoke-fresh-install.mjs",
+    "verify:tui": "corepack pnpm run build && corepack pnpm run qa:tui && corepack pnpm run qa:tui:experience && corepack pnpm run doctor && corepack pnpm run smoke:tui && corepack pnpm run smoke:opentui && corepack pnpm run smoke:tui:opentui && corepack pnpm run smoke:packaged && corepack pnpm run smoke:chat",
+    "release:tui": "node scripts/release-tui.mjs",
+    "prepublishOnly": "npm run build",
+    "lint": "echo noop"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "cli",
+    "claude",
+    "codex",
+    "multiplayer",
+    "coding",
+    "collaboration",
+    "rooms"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hacksurvivor/co-od.git"
+  },
+  "homepage": "https://co-od.dev",
+  "bugs": {
+    "url": "https://github.com/hacksurvivor/co-od/issues"
+  },
+  "license": "MIT",
+  "author": "co-od contributors",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@opentui/core": "0.3.0",
+    "@opentui/react": "0.3.0",
+    "convex": "1.32.0",
+    "open": "^10.1.0",
+    "react": "^19.2.0",
+    "web-tree-sitter": "0.25.10",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.6.2"
+  }
+}

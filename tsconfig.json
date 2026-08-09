@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "allowSyntheticDefaultImports": true,
+    "types": ["node"],
+    "outDir": "dist",
+    "declaration": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/react",
+    "rootDir": "src",
+    // Pin react type resolution to THIS package's @types/react@19.
+    // @opentui/react ships no @types dependency, so its d.ts resolves
+    // whatever @types/react pnpm hoisted to the workspace root — in CI that
+    // is apps/web's 18.x pin, splitting the compilation across two React
+    // type identities ("'Message' cannot be used as a JSX component").
+    "paths": {
+      "react": ["./node_modules/@types/react"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime"]
+    }
+  },
+  "include": ["src/**/*"]
+}
