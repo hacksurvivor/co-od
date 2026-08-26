@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { executeAcpAgent } from "./acp.js";
 import {
   existingAttachmentPaths,
   coodeIsolatedBrowser,
@@ -11,6 +11,7 @@ import {
   type ExecuteOptions,
   type ExecuteResult,
 } from "./base.js";
+import { openCodeNativeSessionState } from "./opencode-server.js";
 
 const OPENCODE_BIN = process.env.OPENCODE_BIN || "opencode";
 
@@ -24,6 +25,7 @@ export function buildOpenCodeArgs(
   options: Pick<ExecuteOptions, "attachments" | "model" | "providerSession"> = {},
 ): string[] {
   const args = ["run"];
+  args.push("--format", "json");
   if (options.providerSession?.providerSessionId) {
     args.push("--session", options.providerSession.providerSessionId);
     if (options.providerSession.mode === "fork") {
@@ -41,80 +43,42 @@ export function buildOpenCodeArgs(
 export class OpenCodeAdapter implements AgentAdapter {
   name = "opencode";
   capabilities = harnessCapabilities({
+    transport: {
+      kind: "acp",
+      protocolVersion: 1,
+      capabilityNegotiation: true,
+      structuredEvents: true,
+    },
     sessionResume: true,
     sessionFork: true,
+    sessionLoad: true,
+    sessionList: true,
+    sessionDelete: true,
+    sessionRewind: true,
+    approvalBridge: true,
+    planReporting: true,
+    diffReporting: true,
+    checkpointing: true,
+    rollback: true,
+    usageReporting: true,
+    costReporting: true,
+    modelDiscovery: true,
+    providerDiscovery: true,
     attachments: true,
     modelSelection: true,
     browser: coodeIsolatedBrowser(),
   });
+  nativeSessionState = openCodeNativeSessionState;
 
   async available(): Promise<boolean> {
     return which(OPENCODE_BIN);
   }
 
   async execute(goal: string, options: ExecuteOptions): Promise<ExecuteResult> {
-    const args = buildOpenCodeArgs(promptWithHarnessCapabilities(goal, options, this.name), {
-      attachments: options.attachments,
-      model: options.model,
-      providerSession: options.providerSession,
-    });
-
-    return new Promise<ExecuteResult>((resolve) => {
-      const child = spawn(OPENCODE_BIN, args, {
-        cwd: options.workDir,
-        env: providerProcessEnvironment({ ...options, provider: this.name }),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-
-      // A piped stdin reads as prompt input — close it immediately or the
-      // provider waits for EOF ("reading additional input from stdin").
-      child.stdin?.end();
-
-      if (options.signal) {
-        options.signal.addEventListener(
-          "abort",
-          () => child.kill("SIGTERM"),
-          { once: true },
-        );
-      }
-
-      let stdout = "";
-      let stderr = "";
-
-      child.stdout?.setEncoding("utf-8");
-      child.stderr?.setEncoding("utf-8");
-
-      child.stdout?.on("data", (chunk: string) => {
-        stdout += chunk;
-        options.onTextDelta?.(chunk);
-        options.onOutput?.(chunk);
-      });
-
-      child.stderr?.on("data", (chunk: string) => {
-        stderr += chunk;
-        options.onOutput?.(chunk);
-      });
-
-      child.on("error", (err) => {
-        resolve({
-          exitCode: 127,
-          stdout,
-          stderr: stderr || err.message,
-          providerSessionId: resolveProviderSessionIdFromResult(
-            `${stdout}\n${stderr || err.message}`,
-            options.providerSession,
-          ),
-        });
-      });
-
-      child.on("close", (code) => {
-        resolve({
-          exitCode: code ?? 1,
-          stdout,
-          stderr,
-          providerSessionId: resolveProviderSessionIdFromResult(`${stdout}\n${stderr}`, options.providerSession),
-        });
-      });
-    });
+    return executeAcpAgent(
+      { executable: OPENCODE_BIN, args: ["acp"], harness: this.name },
+      promptWithHarnessCapabilities(goal, options, this.name),
+      options,
+    );
   }
 }

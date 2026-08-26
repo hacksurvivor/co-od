@@ -111,7 +111,7 @@ test("loadRoomDashboardData returns agents/runs and captures API errors", async 
       if (path.endsWith("/agents")) return { agents: [{ _id: "agent-a", name: "Builder" }] };
       if (path.endsWith("/messages")) return { messages: [{ _id: "m1", author_type: "user", body_md: "hi" }] };
       if (path.endsWith("/patches")) return { patches: [{ _id: "p1", run_id: "run-a", status: "proposed" }] };
-      if (path.endsWith("/presence")) return { presence: [{ name: "Alex", workos_user_id: "user_1" }] };
+      if (path.endsWith("/presence")) return { presence: [{ name: "Sergey", workos_user_id: "user_1" }] };
       return { runs: [{ _id: "run-a", status: "succeeded" }] };
     },
   });
@@ -121,7 +121,7 @@ test("loadRoomDashboardData returns agents/runs and captures API errors", async 
     runs: [{ _id: "run-a", status: "succeeded" }],
     messages: [{ _id: "m1", author_type: "user", body_md: "hi" }],
     patches: [{ _id: "p1", run_id: "run-a", status: "proposed" }],
-    presence: [{ name: "Alex", workos_user_id: "user_1" }],
+    presence: [{ name: "Sergey", workos_user_id: "user_1" }],
     error: undefined,
   });
 

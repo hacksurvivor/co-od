@@ -145,3 +145,40 @@ test("delegation rows stop cycles", () => {
 
   assert.ok(rows.some((row) => row.relation === "cycle"));
 });
+
+test("canonical graph identity overrides legacy lineage and renders meaningful progress", () => {
+  const runs = [
+    {
+      _id: "run-specialist",
+      agent_id: "agent-claude",
+      status: "running",
+      goal: "Raw specialist goal",
+      created_at: 200,
+      delegation_graph_id: "graph-1",
+      delegation_operation_id: "operation-research",
+      delegation_parent_operation_id: "operation-lead",
+      delegation_role: "research",
+      delegation_state: "running",
+      delegation_current_action: "Checking the multiplayer approval path",
+    },
+    {
+      _id: "run-lead",
+      agent_id: "agent-codex",
+      status: "queued",
+      goal: "Lead",
+      created_at: 300,
+      delegation_graph_id: "graph-1",
+      delegation_operation_id: "operation-lead",
+      delegation_role: "lead",
+      delegation_state: "awaitingApproval",
+    },
+    { _id: "legacy", status: "running", goal: "Other graph", created_at: 1 },
+  ];
+
+  const rows = buildDelegationRows(runs[0], runs);
+  assert.deepEqual(rows.map((row) => [row.runId, row.role, row.status, row.depth]), [
+    ["run-lead", "lead", "awaitingApproval", 0],
+    ["run-specialist", "research", "running", 1],
+  ]);
+  assert.equal(rows[1].goal, "Checking the multiplayer approval path");
+});

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 import {
@@ -9,18 +10,85 @@ import {
   promptWithHarnessCapabilities,
   providerProcessEnvironment,
   resolveProviderSessionIdFromResult,
+  withDeclaredHarnessCapabilityReceipt,
   type AgentAdapter,
   type ExecuteOptions,
   type ExecuteResult,
   type HarnessActivityKind,
   type HarnessActivityUpdate,
+  type HarnessArtifactUpdate,
+  type HarnessNativeControlService,
 } from "./base.js";
+import {
+  harnessArtifactContext,
+  harnessArtifactFromResource,
+  harnessArtifactsFromToolResult,
+} from "./harness-artifacts.js";
 import {
   CodexAppServerTurnTerminatedError,
   disposeCodexAppServer,
   getCodexAppServer,
   runCodexAppServerTurn,
 } from "./codex-app-server.js";
+
+const codexNativeControls: HarnessNativeControlService = {
+  async snapshot(context) {
+    const client = getCodexAppServer();
+    await client.ensureStarted();
+    const list = async (archived: boolean) => {
+      const response = await client.request("thread/list", {
+        archived,
+        cwd: context.workDir,
+        limit: 50,
+        sortKey: "updated_at",
+        sortDirection: "desc",
+      }) as { data?: Array<Record<string, unknown>> };
+      return (response.data || []).map((thread) => ({
+        id: String(thread.id || ""),
+        name: compactText(thread.name || thread.preview, 160) || "Untitled Codex task",
+        status: compactText(thread.status, 80) || (archived ? "archived" : "idle"),
+        updatedAt: Number(thread.updatedAt || 0),
+      })).filter((thread) => thread.id);
+    };
+    const [active, archived] = await Promise.all([list(false), list(true)]);
+    const item = (thread: Awaited<ReturnType<typeof list>>[number], isArchived: boolean) => ({
+      id: thread.id,
+      providerID: thread.id,
+      title: thread.name,
+      detail: [
+        thread.status,
+        thread.updatedAt > 0 ? new Date(thread.updatedAt * 1_000).toISOString() : undefined,
+      ].filter(Boolean).join(" · "),
+      status: isArchived ? "unknown" as const
+        : /active|running|working/i.test(thread.status) ? "working" as const : "ready" as const,
+      actions: [{
+        id: isArchived ? "codex-unarchive-thread" : "codex-archive-thread",
+        title: isArchived ? "Unarchive" : "Archive",
+        risk: isArchived ? "safe" as const : "destructive" as const,
+        ...(isArchived ? {} : { confirmation: "ARCHIVE" }),
+      }],
+    });
+    return {
+      contractVersion: 1,
+      harness: "codex",
+      observedAt: new Date().toISOString(),
+      groups: [
+        { id: "active-threads", title: "Active tasks", items: active.map((thread) => item(thread, false)) },
+        { id: "archived-threads", title: "Archived tasks", items: archived.map((thread) => item(thread, true)) },
+      ],
+    };
+  },
+  async perform(context, actionID, providerID) {
+    if (!providerID) throw new Error("The Codex task is no longer attached to this relay.");
+    const method = actionID === "codex-archive-thread" ? "thread/archive"
+      : actionID === "codex-unarchive-thread" ? "thread/unarchive" : undefined;
+    if (!method) throw new Error("Unsupported Codex task action.");
+    const client = getCodexAppServer();
+    await client.ensureStarted();
+    await client.request(method, { threadId: providerID });
+    return this.snapshot(context);
+  },
+};
 
 function which(cmd: string): boolean {
   const paths = (process.env.PATH || "").split(":");
@@ -63,12 +131,16 @@ const activityTitle = (
 ): string => {
   const active = phase === "started";
   switch (kind) {
+    case "artifact": return subject
+      ? `${active ? "Opening" : "Opened"} ${subject}`
+      : active ? "Opening an artifact" : "Opened an artifact";
     case "tests": return active ? "Running checks" : "Ran checks";
     case "search": return active ? "Searching files" : "Searched files";
     case "read": return active ? "Reading files" : "Read files";
     case "file": return subject
       ? `${active ? "Editing" : "Edited"} ${subject}`
       : active ? "Editing files" : "Edited files";
+    case "image": return active ? "Viewing an image" : "Viewed an image";
     case "browser": return active ? "Browsing" : "Browsed";
     case "plan": return active ? "Updating the plan" : "Updated the plan";
     case "tool": return subject
@@ -78,7 +150,7 @@ const activityTitle = (
   }
 };
 
-export function codexActivityFromEvent(
+function codexSingleActivityFromEvent(
   event: Record<string, unknown>,
 ): HarnessActivityUpdate | undefined {
   const eventType = String(event.type || "");
@@ -136,6 +208,14 @@ export function codexActivityFromEvent(
         : compactText(error?.message, 1_024);
       const durationMs = durationMilliseconds(item.duration_ms ?? item.durationMs);
       const identifier = [server, tool].filter(Boolean).join(".");
+      const artifacts = phase === "completed" && item.artifact_deferred !== true
+        ? harnessArtifactsFromToolResult(item.result ?? item.content_items ?? item.output, {
+          provider: "codex",
+          server,
+          tool,
+          title: tool,
+        })
+        : [];
       return {
         kind,
         phase,
@@ -144,6 +224,7 @@ export function codexActivityFromEvent(
         ...(identifier ? { tool: identifier } : {}),
         ...(input ? { input, codeLanguage: "json" as const } : {}),
         ...(phase === "completed" && output ? { output } : {}),
+        ...(artifacts.length > 0 ? { artifacts } : {}),
         ...(durationMs !== undefined ? { durationMs } : {}),
         ...(phase === "completed" && errorMessage
           ? { result: errorMessage }
@@ -181,12 +262,13 @@ export function codexActivityFromEvent(
     case "image_view": {
       const path = compactText(item.path, 2_048);
       return {
-        kind: "tool",
+        kind: "image",
         phase,
         title: phase === "started" ? "Viewing an image" : "Viewed an image",
         detail: path,
         tool: "image_view",
         ...(path ? { input: path, codeLanguage: "text" as const } : {}),
+        ...(path ? { imagePaths: [path] } : {}),
         ...(phase === "completed" ? { result: "Completed" } : {}),
       };
     }
@@ -222,6 +304,348 @@ export function codexActivityFromEvent(
     default:
       return undefined;
   }
+}
+
+type CodexAgentLabel = {
+  name: string;
+  task: string;
+  parentAgentID?: string;
+};
+
+type CodexAgentLabels = Map<string, CodexAgentLabel>;
+
+const codexSubagentTitle = (agentPath: unknown): string => {
+  const path = compactText(agentPath, 512) || "delegated task";
+  const leaf = path.split("/").filter(Boolean).at(-1) || path;
+  const words = leaf.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+  return words ? `${words.charAt(0).toUpperCase()}${words.slice(1)}` : "Delegated task";
+};
+
+const codexAgentIDs = (item: Record<string, unknown>): string[] => {
+  const receiverIDs = item.receiver_thread_ids ?? item.receiverThreadIds;
+  const states = item.agents_states ?? item.agentsStates;
+  const candidates = [
+    ...(Array.isArray(receiverIDs) ? receiverIDs : []),
+    ...(states && typeof states === "object" && !Array.isArray(states)
+      ? Object.keys(states as Record<string, unknown>)
+      : []),
+  ];
+  return [...new Set(candidates
+    .map((candidate) => compactText(candidate, 512))
+    .filter((candidate): candidate is string => Boolean(candidate)))];
+};
+
+const codexAgentState = (
+  item: Record<string, unknown>,
+  agentID: string,
+): Record<string, unknown> | undefined => {
+  const states = item.agents_states ?? item.agentsStates;
+  if (!states || typeof states !== "object" || Array.isArray(states)) return undefined;
+  const state = (states as Record<string, unknown>)[agentID];
+  return state && typeof state === "object" && !Array.isArray(state)
+    ? state as Record<string, unknown>
+    : undefined;
+};
+
+const codexAgentOutcome = (
+  tool: string,
+  eventPhase: HarnessActivityUpdate["phase"],
+  callStatus: string,
+  agentStatus: string,
+): { phase: HarnessActivityUpdate["phase"]; result: string; titleVerb: string; terminal: boolean } => {
+  const normalizedStatus = agentStatus.replace(/[_-]/g, "").toLowerCase();
+  const failed = callStatus.toLowerCase() === "failed"
+    || ["errored", "interrupted", "notfound"].includes(normalizedStatus);
+  if (failed) return { phase: "completed", result: "Failed", titleVerb: "Failed", terminal: true };
+  if (["completed", "shutdown"].includes(normalizedStatus) || tool === "closeagent") {
+    return { phase: "completed", result: "Completed", titleVerb: "Completed", terminal: true };
+  }
+  if (["running", "pendinginit"].includes(normalizedStatus)
+    || ["spawnagent", "sendinput", "resumeagent"].includes(tool)) {
+    return { phase: "started", result: "Working", titleVerb: "Started", terminal: false };
+  }
+  if (tool === "wait" && eventPhase === "completed") {
+    return { phase: "completed", result: "Completed", titleVerb: "Completed", terminal: true };
+  }
+  return eventPhase === "started"
+    ? { phase: "started", result: "Working", titleVerb: "Started", terminal: false }
+    : { phase: "completed", result: "Completed", titleVerb: "Completed", terminal: true };
+};
+
+/** Project Codex collaboration calls into one provider-neutral lifecycle per target agent. */
+export function codexActivitiesFromEvent(
+  event: Record<string, unknown>,
+  labels: CodexAgentLabels = new Map(),
+): HarnessActivityUpdate[] {
+  const eventType = String(event.type || "");
+  const item = event.item as Record<string, unknown> | undefined;
+  if (!item || (eventType !== "item.started" && eventType !== "item.completed")) return [];
+  if (String(item.type || "") === "subagent_activity") {
+    const agentID = compactText(item.agent_thread_id ?? item.agentThreadId, 512);
+    if (!agentID) return [];
+    const kind = String(item.kind || "").replace(/[_-]/g, "").toLowerCase();
+    const failed = kind === "interrupted";
+    const name = codexSubagentTitle(item.agent_path ?? item.agentPath);
+    const previous = labels.get(agentID);
+    const task = previous?.task || name;
+    if (failed) labels.delete(agentID);
+    else labels.set(agentID, { name, task, parentAgentID: previous?.parentAgentID });
+    return [{
+      kind: "tool",
+      phase: failed ? "completed" : "started",
+      title: `${failed ? "Failed" : "Started"} ${task}`,
+      detail: "Codex subagent",
+      tool: "collaboration.subAgent",
+      result: failed ? "Failed" : "Working",
+      agentID,
+      agentName: name,
+      agentTask: task,
+      agentStatus: failed ? "failed" : "working",
+      agentProgress: failed ? "Stopped before finishing" : "Starting",
+    }];
+  }
+  if (String(item.type || "") !== "collab_agent_tool_call") {
+    const activity = codexSingleActivityFromEvent(event);
+    return activity ? [activity] : [];
+  }
+
+  const rawTool = compactText(item.tool, 160) || "agent";
+  const normalizedTool = rawTool.replace(/[_-]/g, "").toLowerCase();
+  const agentIDs = codexAgentIDs(item);
+  if (agentIDs.length === 0) {
+    // Current Codex App Server wait events can omit receiver/state arrays even
+    // while a subAgentActivity is live. Waiting is transport plumbing, not a
+    // user-facing action; the active agent row already carries the truth.
+    if (normalizedTool === "wait") return [];
+    const activity = codexSingleActivityFromEvent(event);
+    return activity ? [activity] : [];
+  }
+
+  const prompt = compactText(item.prompt, 4_096);
+  const senderID = compactText(item.sender_thread_id ?? item.senderThreadId, 512);
+  const eventPhase = eventType === "item.started" ? "started" : "completed";
+  const callStatus = compactText(item.status, 80) || "";
+
+  return agentIDs.map((agentID) => {
+    const state = codexAgentState(item, agentID);
+    const agentStatus = compactText(state?.status, 80) || "";
+    const outcome = codexAgentOutcome(normalizedTool, eventPhase, callStatus, agentStatus);
+    const previous = labels.get(agentID);
+    const task = prompt || previous?.task || "Delegated task";
+    const name = previous?.name || "Codex subagent";
+    if (normalizedTool === "spawnagent") {
+      labels.set(agentID, {
+        name,
+        task,
+        ...(senderID && senderID !== agentID ? { parentAgentID: senderID } : {}),
+      });
+    }
+    if (outcome.terminal) labels.delete(agentID);
+    const output = boundedOutput(state?.message);
+    return {
+      kind: "tool",
+      phase: outcome.phase,
+      title: `${outcome.titleVerb} ${task}`,
+      detail: "Codex subagent",
+      tool: `collaboration.${rawTool}`,
+      ...(normalizedTool === "spawnagent" && prompt
+        ? { input: prompt, codeLanguage: "text" as const }
+        : {}),
+      ...(output ? { output } : {}),
+      result: outcome.result,
+      agentID,
+      ...(senderID && senderID !== agentID ? { parentAgentID: senderID } : {}),
+      agentName: name,
+      agentTask: task,
+      agentStatus: outcome.result === "Failed"
+        ? "failed"
+        : outcome.terminal ? "completed" : "working",
+      agentProgress: output || (outcome.terminal ? outcome.result : "Working"),
+    };
+  });
+}
+
+/** Close subagents that Codex announced without a matching terminal item. */
+export function codexCompletedSubagentActivities(
+  labels: CodexAgentLabels,
+  failed = false,
+): HarnessActivityUpdate[] {
+  const activities = [...labels.entries()].map(([agentID, label]) => ({
+    kind: "tool" as const,
+    phase: "completed" as const,
+    title: `${failed ? "Failed" : "Completed"} ${label.task}`,
+    detail: "Codex subagent",
+    tool: "collaboration.subAgent",
+    result: failed ? "Failed" : "Completed",
+    agentID,
+    ...(label.parentAgentID ? { parentAgentID: label.parentAgentID } : {}),
+    agentName: label.name,
+    agentTask: label.task,
+    agentStatus: failed ? "failed" as const : "completed" as const,
+    agentProgress: failed ? "Stopped before finishing" : "Finished",
+  }));
+  labels.clear();
+  return activities;
+}
+
+function codexChildActivity(
+  activity: HarnessActivityUpdate,
+  context: { threadId: string; parentThreadId?: string },
+  labels: CodexAgentLabels,
+): HarnessActivityUpdate {
+  const label = labels.get(context.threadId);
+  return {
+    ...activity,
+    agentID: context.threadId,
+    ...(context.parentThreadId ? { parentAgentID: context.parentThreadId } : {}),
+    agentName: label?.name || "Codex subagent",
+    agentTask: label?.task || "Delegated task",
+    agentStatus: "working",
+    agentProgress: activity.title,
+  };
+}
+
+function codexChildMessageActivity(
+  item: Record<string, unknown>,
+  context: { threadId: string; parentThreadId?: string },
+  labels: CodexAgentLabels,
+): HarnessActivityUpdate | undefined {
+  const message = compactText(item.text, 512);
+  if (!message) return undefined;
+  const label = labels.get(context.threadId);
+  return {
+    kind: "plan",
+    // A child message is progress inside the delegated lifecycle, not the
+    // lifecycle's terminal event. The parent completion closes the member.
+    phase: "started",
+    title: message,
+    detail: "Subagent update",
+    tool: "collaboration.progress",
+    agentID: context.threadId,
+    ...(context.parentThreadId ? { parentAgentID: context.parentThreadId } : {}),
+    agentName: label?.name || "Codex subagent",
+    agentTask: label?.task || "Delegated task",
+    agentStatus: "working",
+    agentProgress: message,
+  };
+}
+
+/** Backwards-compatible single-activity projection used by existing consumers. */
+export function codexActivityFromEvent(
+  event: Record<string, unknown>,
+): HarnessActivityUpdate | undefined {
+  return codexActivitiesFromEvent(event)[0];
+}
+
+const nestedString = (value: unknown, keys: string[]): string | undefined => {
+  const source = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+  if (!source) return undefined;
+  for (const key of keys) {
+    const candidate = source[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return undefined;
+};
+
+export const codexMcpAppResourceURI = (item: Record<string, unknown>): string | undefined => {
+  const appContext = item.appContext as Record<string, unknown> | undefined;
+  const result = item.result as Record<string, unknown> | undefined;
+  const meta = result?._meta as Record<string, unknown> | undefined;
+  const ui = meta?.ui as Record<string, unknown> | undefined;
+  return nestedString(appContext, ["resourceUri"])
+    || compactText(item.mcpAppResourceUri, 4_096)
+    || nestedString(ui, ["resourceUri"])
+    || nestedString(meta, ["ui/resourceUri", "openai/outputTemplate"]);
+};
+
+type CodexAppServerRequester = {
+  request(method: string, params?: Record<string, unknown>): Promise<unknown>;
+};
+
+/** Hydrate one completed MCP App into a provider-neutral artifact activity. */
+export async function codexArtifactActivityFromItem(
+  item: Record<string, unknown>,
+  threadId: string,
+  client: CodexAppServerRequester,
+): Promise<HarnessActivityUpdate | undefined> {
+  if (item.type !== "mcpToolCall" || item.status === "failed") return undefined;
+  const server = compactText(item.server, 256);
+  const tool = compactText(item.tool, 256);
+  if (!server || !tool) return undefined;
+  const result = item.result;
+  const resourceURI = codexMcpAppResourceURI(item);
+  const appContext = item.appContext as Record<string, unknown> | undefined;
+  const appName = compactText(appContext?.appName, 160);
+  const title = appName || tool.replace(/[_-]+/g, " ");
+  const context = harnessArtifactContext({
+    ...(result && typeof result === "object" ? result as Record<string, unknown> : {}),
+    appContext,
+  });
+  let artifacts: HarnessArtifactUpdate[] = [];
+
+  if (resourceURI) {
+    try {
+      const response = await client.request("mcpServer/resource/read", {
+        threadId,
+        server,
+        uri: resourceURI,
+        ...(typeof item.id === "string" ? { originCallId: item.id } : {}),
+        ...(typeof appContext?.connectorId === "string"
+          ? { connectorId: appContext.connectorId }
+          : {}),
+      }) as { contents?: unknown[] };
+      artifacts = (response.contents || []).map((resource, index) =>
+        harnessArtifactFromResource(resource, {
+          provider: "codex",
+          server,
+          tool,
+          title,
+          uri: resourceURI,
+          context,
+          forceKind: "mcpApp",
+          interactive: true,
+          displayMode: "inline",
+        }, index)).filter((artifact): artifact is HarnessArtifactUpdate => Boolean(artifact));
+    } catch {
+      // A direct embedded artifact or a link fallback remains useful when an
+      // older Codex App Server cannot hydrate the MCP resource.
+    }
+  }
+
+  if (artifacts.length === 0) {
+    artifacts = harnessArtifactsFromToolResult(result, {
+      provider: "codex",
+      server,
+      tool,
+      title,
+      uri: resourceURI,
+    });
+  }
+  if (artifacts.length === 0 && resourceURI) {
+    artifacts = [{
+      id: createHash("sha256").update(`${server}\0${tool}\0${resourceURI}`).digest("hex").slice(0, 32),
+      kind: "link",
+      title,
+      mediaType: "text/html;profile=mcp-app",
+      fileName: `${tool.replace(/[^a-z0-9._-]+/gi, "-").slice(0, 96) || "artifact"}.html`,
+      uri: resourceURI,
+      provider: "codex",
+      server,
+      tool,
+    }];
+  }
+  if (artifacts.length === 0) return undefined;
+  return {
+    kind: "artifact",
+    phase: "completed",
+    title: activityTitle("artifact", "completed", title),
+    detail: `${server} · ${tool}`,
+    tool: `${server}.${tool}`,
+    result: "Ready",
+    artifacts,
+  };
 }
 
 export function codexReasoningSummaryActivity(
@@ -416,6 +840,7 @@ export function translateAppServerItem(
       type: eventType,
       item: {
         type: "mcp_tool_call",
+        id: item.id,
         server: item.server,
         tool: item.tool,
         arguments: item.arguments,
@@ -423,6 +848,10 @@ export function translateAppServerItem(
         error: item.error,
         status: item.status,
         duration_ms: item.durationMs,
+        appContext: item.appContext,
+        mcpAppResourceUri: item.mcpAppResourceUri,
+        pluginId: item.pluginId,
+        artifact_deferred: true,
       },
     };
   }
@@ -461,10 +890,28 @@ export function translateAppServerItem(
       type: eventType,
       item: {
         type: "collab_agent_tool_call",
+        id: item.id,
         tool: item.tool,
         prompt: item.prompt,
         status: item.status,
-        duration_ms: item.durationMs,
+        sender_thread_id: item.senderThreadId,
+        receiver_thread_ids: item.receiverThreadIds,
+        model: item.model,
+        reasoning_effort: item.reasoningEffort,
+        agents_states: item.agentsStates,
+        ...(item.durationMs !== undefined ? { duration_ms: item.durationMs } : {}),
+      },
+    };
+  }
+  if (type === "subAgentActivity") {
+    return {
+      type: eventType,
+      item: {
+        type: "subagent_activity",
+        id: item.id,
+        kind: item.kind,
+        agent_thread_id: item.agentThreadId,
+        agent_path: item.agentPath,
       },
     };
   }
@@ -492,9 +939,24 @@ export function separateAppServerMessageDelta(
   return delta;
 }
 
+export const codexDisplayStdout = (
+  transportStdout: string,
+  finalMessage: string,
+  isRoomExecution: boolean,
+): string => isRoomExecution && finalMessage.trim()
+  ? finalMessage
+  : transportStdout;
+
 export class CodexAdapter implements AgentAdapter {
   name = "codex";
   capabilities = harnessCapabilities({
+    transport: {
+      kind: "appServer",
+      // App Server is structured, but this adapter does not yet persist its
+      // initialize response as negotiated capability evidence.
+      capabilityNegotiation: false,
+      structuredEvents: true,
+    },
     sessionResume: true,
     sessionFork: true,
     attachments: true,
@@ -503,8 +965,17 @@ export class CodexAdapter implements AgentAdapter {
     speedSelection: true,
     permissionSelection: true,
     persistentProcess: true,
+    nativeSteer: true,
+    approvalBridge: true,
+    planReporting: true,
+    nativeReview: true,
+    diffReporting: true,
+    usageReporting: true,
+    rateLimitReporting: true,
+    modelDiscovery: true,
     browser: coodeIsolatedBrowser(),
   });
+  nativeControls = codexNativeControls;
 
   async available(): Promise<boolean> {
     return which("codex");
@@ -536,6 +1007,8 @@ export class CodexAdapter implements AgentAdapter {
     let reasoningSummary = "";
     let lastReasoningTitle = "";
     let lastReasoningPublishedAt = 0;
+    const completedMcpItems: Record<string, unknown>[] = [];
+    const collaborationLabels: CodexAgentLabels = new Map();
     const processEnvironment = providerProcessEnvironment({
       ...options,
       provider: this.name,
@@ -548,16 +1021,67 @@ export class CodexAdapter implements AgentAdapter {
       : options.permissionMode === "plan"
         ? "read-only"
         : "workspace-write";
+    const approvalPolicy = options.permissionMode === "approve"
+      || options.permissionMode === "fullAccess"
+      ? "never"
+      : "on-request";
     const result = await runCodexAppServerTurn(goal, {
         workDir: options.workDir,
         model: options.model,
         effort: options.effort,
         speed: options.speed,
         sandbox,
-        approvalPolicy: "never",
+        approvalPolicy,
         threadId: sourceThreadId,
         forkThread: options.providerSession?.mode === "fork",
         workspaceAccess: options.workspaceAccess,
+        permissionMode: options.permissionMode,
+        nativeReview: options.nativeReview,
+        onRuntimeControl: options.onRuntimeControl,
+        onRawEvent: options.onRawEvent,
+        onPermissionRequest: async (request) => {
+          options.onActivity?.({
+            kind: request.kind === "execute" ? "command" : "file",
+            phase: "started",
+            title: `Approval required: ${request.title}`,
+            tool: request.tool,
+            ...(request.input ? { input: request.input, codeLanguage: "json" } : {}),
+          });
+          const decision = options.onPermissionRequest
+            ? await options.onPermissionRequest(request)
+            : undefined;
+          if (decision) {
+            const selected = decision.outcome === "selected"
+              ? request.options.find((option) => option.id === decision.optionID)
+              : undefined;
+            options.onActivity?.({
+              kind: request.kind === "execute" ? "command" : "file",
+              phase: "completed",
+              title: request.title,
+              tool: request.tool,
+              result: selected?.name || "Cancelled",
+            });
+            return decision;
+          }
+          // Returning undefined is not part of the shared callback contract;
+          // omit the callback entirely when no UI broker exists by delegating
+          // to the App Server policy below.
+          const fallback = options.permissionMode === "plan"
+            ? request.options.find((option) => option.kind === "reject_always")
+              || request.options.find((option) => option.kind === "reject_once")
+            : request.options.find((option) => option.kind === "reject_once")
+              || request.options.find((option) => option.kind === "reject_always");
+          options.onActivity?.({
+            kind: request.kind === "execute" ? "command" : "file",
+            phase: "completed",
+            title: request.title,
+            tool: request.tool,
+            result: fallback?.name || "Cancelled",
+          });
+          return fallback
+            ? { outcome: "selected", optionID: fallback.id }
+            : { outcome: "cancelled" };
+        },
         client: appServer,
         signal: options.signal,
         environmentOverrides: processEnvironment,
@@ -591,13 +1115,29 @@ export class CodexAdapter implements AgentAdapter {
           lastReasoningPublishedAt = now;
           options.onActivity?.(activity);
         },
-        onItem: (item, phase) => {
+        onItem: (item, phase, context) => {
+          if (phase === "completed"
+              && item.type === "mcpToolCall"
+              && !context?.isSubagent) {
+            completedMcpItems.push(item);
+          }
+          if (context?.isSubagent
+              && phase === "completed"
+              && item.type === "agentMessage") {
+            const progress = codexChildMessageActivity(item, context, collaborationLabels);
+            if (progress) options.onActivity?.(progress);
+          }
           // Translate app-server items into the exec JSONL event shape the
           // room reporting + display pipeline already understands.
           const translated = translateAppServerItem(item, phase);
           if (!translated) return;
-          const activity = codexActivityFromEvent(translated);
-          if (activity) options.onActivity?.(activity);
+          for (const activity of codexActivitiesFromEvent(translated, collaborationLabels)) {
+            options.onActivity?.(
+              context?.isSubagent
+                ? codexChildActivity(activity, context, collaborationLabels)
+                : activity,
+            );
+          }
           if (phase !== "completed") return;
           stdout += `${JSON.stringify(translated)}
 `;
@@ -612,6 +1152,20 @@ export class CodexAdapter implements AgentAdapter {
           }
         },
       });
+    for (const activity of codexCompletedSubagentActivities(
+      collaborationLabels,
+      result.exitCode !== 0,
+    )) {
+      options.onActivity?.(activity);
+    }
+    for (const item of completedMcpItems) {
+      const activity = await codexArtifactActivityFromItem(
+        item,
+        result.threadId,
+        appServer,
+      );
+      if (activity) options.onActivity?.(activity);
+    }
     // Synthesize thread.started so provider-session extraction keeps working.
     const threadEvent = { type: "thread.started", thread_id: result.threadId };
     stdout = `${JSON.stringify(threadEvent)}
@@ -624,8 +1178,11 @@ ${stdout}`;
     }
     return {
       exitCode: result.exitCode,
-      stdout: `${stdout}${result.finalMessage}
-`,
+      stdout: codexDisplayStdout(
+        `${stdout}${result.finalMessage}\n`,
+        result.finalMessage,
+        isRoomExecution,
+      ),
       stderr: result.errorMessage || "",
       providerSessionId: result.threadId,
     };
@@ -643,13 +1200,19 @@ ${stdout}`;
     const hasRoomReportingContext = Boolean(
       options.roomId && options.runId && options.serverUrl && options.sessionToken,
     );
+    const finish = (result: ExecuteResult) => withDeclaredHarnessCapabilityReceipt(
+      result,
+      this.name,
+      this.capabilities,
+      options,
+    );
 
     // The persistent app-server and exec fallback both inherit the user's
     // normal Codex plugins, skills, and MCP servers. Browser authority remains
     // scoped separately through co·ode's short-lived browser capability.
     if (process.env.CO_OD_CODEX_EXEC !== "1") {
       try {
-        return await this.executeViaAppServer(executionGoal, options, hasRoomReportingContext);
+        return finish(await this.executeViaAppServer(executionGoal, options, hasRoomReportingContext));
       } catch (error) {
         if (error instanceof CodexAppServerTurnTerminatedError) {
           // The provider accepted this turn. Never duplicate it through the
@@ -659,6 +1222,11 @@ ${stdout}`;
         if (options.providerSession?.mode === "fork") {
           // `codex exec` has no provider-native fork equivalent. Failing here
           // is safer than creating an empty lookalike task with lost history.
+          throw error;
+        }
+        if (options.nativeReview) {
+          // A normal exec prompt is not equivalent to App Server's review
+          // target/delivery semantics, so never silently downgrade it.
           throw error;
         }
         // Daemon unavailable or dispatch failed — fall through to exec.
@@ -677,7 +1245,8 @@ ${stdout}`;
       json: isRoomExecution,
     });
 
-    return new Promise<ExecuteResult>((resolve, reject) => {
+    const collaborationLabels: CodexAgentLabels = new Map();
+    const result = await new Promise<ExecuteResult>((resolve, reject) => {
       const child = spawn("codex", args, {
         cwd: workDir,
         env: providerProcessEnvironment({ ...options, provider: this.name }),
@@ -693,7 +1262,6 @@ ${stdout}`;
       let lastAgentMessage = "";
       let receivedAgentDelta = false;
       let receivedAgentMessage = false;
-
       child.stdout?.setEncoding("utf-8");
       child.stderr?.setEncoding("utf-8");
 
@@ -704,9 +1272,16 @@ ${stdout}`;
           stdout += line + "\n";
           try {
             const event = JSON.parse(line) as Record<string, unknown>;
+            void options.onRawEvent?.({
+              observedAt: new Date().toISOString(),
+              direction: "providerToCoode",
+              channel: "protocol",
+              payload: event,
+            });
             const item = event.item as Record<string, unknown> | undefined;
-            const activity = codexActivityFromEvent(event);
-            if (activity) options.onActivity?.(activity);
+            for (const activity of codexActivitiesFromEvent(event, collaborationLabels)) {
+              options.onActivity?.(activity);
+            }
             const delta = typeof event.delta === "string"
               ? event.delta
               : typeof item?.delta === "string"
@@ -752,6 +1327,12 @@ ${stdout}`;
               );
             }
           } catch {
+            void options.onRawEvent?.({
+              observedAt: new Date().toISOString(),
+              direction: "providerToCoode",
+              channel: "stdout",
+              payload: `${line}\n`,
+            });
             // Not valid JSON — pass through as raw output
             onOutput?.(line + "\n");
           }
@@ -759,28 +1340,47 @@ ${stdout}`;
       } else {
         // No room context — raw output mode (original behavior)
         child.stdout?.on("data", (chunk: string) => {
+          void options.onRawEvent?.({
+            observedAt: new Date().toISOString(),
+            direction: "providerToCoode",
+            channel: "stdout",
+            payload: chunk,
+          });
           stdout += chunk;
           onOutput?.(chunk);
         });
       }
 
       child.stderr?.on("data", (chunk: string) => {
+        void options.onRawEvent?.({
+          observedAt: new Date().toISOString(),
+          direction: "providerToCoode",
+          channel: "stderr",
+          payload: chunk,
+        });
         stderr += chunk;
         onOutput?.(chunk);
       });
 
-      child.on("exit", (code) => {
-        // If we parsed JSONL, include the last agent message in stdout for the caller
-        if (isRoomExecution && lastAgentMessage) {
-          stdout += `\n--- Agent Response ---\n${lastAgentMessage}\n`;
-        }
+      // `exit` can fire before the stdio pipes are fully drained. Resolve on
+      // `close` so short-lived providers cannot lose their final JSONL lines
+      // during app-server fallback.
+      child.on("close", (code) => {
+        // Keep provider JSONL available only for session-id recovery. Room
+        // consumers need the final human response, never the transport stream.
+        const providerOutput = `${stdout}\n${stderr}`;
+        const displayStdout = codexDisplayStdout(
+          stdout,
+          lastAgentMessage,
+          isRoomExecution,
+        );
         const providerSessionId = resolveProviderSessionIdFromResult(
-          `${stdout}\n${stderr}`,
+          providerOutput,
           options.providerSession,
         );
         resolve({
           exitCode: code ?? 1,
-          stdout,
+          stdout: displayStdout,
           stderr,
           providerSessionId,
         });
@@ -800,5 +1400,12 @@ ${stdout}`;
         );
       }
     });
+    for (const activity of codexCompletedSubagentActivities(
+      collaborationLabels,
+      result.exitCode !== 0,
+    )) {
+      options.onActivity?.(activity);
+    }
+    return finish(result);
   }
 }

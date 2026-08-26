@@ -3,7 +3,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
-  cpSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -12,7 +11,6 @@ import {
 import { tmpdir } from "node:os";
 import {
   basename,
-  delimiter,
   dirname,
   isAbsolute,
   join,
@@ -21,7 +19,6 @@ import { fileURLToPath } from "node:url";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const packageDir = dirname(scriptDir);
-const repoRoot = join(packageDir, "..", "..");
 const tmp = mkdtempSync(join(tmpdir(), "co-od-pack-smoke-"));
 
 function run(command, args, options = {}) {
@@ -35,15 +32,16 @@ function run(command, args, options = {}) {
 
 function parsePackOutput(output) {
   const trimmed = output.trim();
-  const start = trimmed.indexOf("[");
-  const end = trimmed.lastIndexOf("]");
-  if (start === -1 || end === -1 || end < start) {
-    throw new Error(`npm pack did not return JSON output: ${trimmed}`);
-  }
-  const parsed = JSON.parse(trimmed.slice(start, end + 1));
-  assert.equal(Array.isArray(parsed), true);
-  assert.equal(parsed.length, 1);
-  return parsed[0];
+  const parsed = JSON.parse(trimmed);
+  // npm 10 returns an array while npm 11 can return an object keyed by
+  // package name when invoked inside a workspace-aware package runner.
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object"
+      ? Object.values(parsed)
+      : [];
+  assert.equal(entries.length, 1);
+  return entries[0];
 }
 
 function requireFile(root, relativePath) {
@@ -57,7 +55,16 @@ function forbidFile(root, relativePath) {
 }
 
 try {
-  const packInfo = parsePackOutput(run("npm", ["pack", "--json", "--pack-destination", tmp]));
+  // The release gate builds immediately before this smoke. Suppress lifecycle
+  // output here so npm's machine-readable pack response remains pure JSON on
+  // every supported npm version.
+  const packInfo = parsePackOutput(run("npm", [
+    "pack",
+    "--json",
+    "--ignore-scripts",
+    "--pack-destination",
+    tmp,
+  ]));
   const tarball = isAbsolute(packInfo.filename)
     ? packInfo.filename
     : join(tmp, basename(packInfo.filename));
@@ -91,17 +98,19 @@ try {
   assert.equal(firstLine, "#!/usr/bin/env node");
 
   const installRoot = join(tmp, "install");
+  run("npm", [
+    "install",
+    "--ignore-scripts",
+    "--no-audit",
+    "--no-fund",
+    "--package-lock=false",
+    "--prefix",
+    installRoot,
+    tarball,
+  ], { cwd: tmp });
   const installedPackage = join(installRoot, "node_modules", "@codegrammer", "co-od");
-  cpSync(extracted, installedPackage, { recursive: true });
-
-  const nodePath = [
-    join(packageDir, "node_modules"),
-    join(repoRoot, "node_modules"),
-    process.env.NODE_PATH,
-  ].filter(Boolean).join(delimiter);
   const env = {
     ...process.env,
-    NODE_PATH: nodePath,
     CO_OD_TUI_DISABLE_DASHBOARD_CACHE: "1",
   };
   const entrypoint = join(installedPackage, "dist", "index.js");

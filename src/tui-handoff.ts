@@ -1,5 +1,7 @@
 import { getAdapter } from "./adapters/index.js";
+import { randomUUID } from "node:crypto";
 import type { ExecuteResult } from "./adapters/base.js";
+import type { RoomTaskDelegationInput } from "./commands/run.js";
 import * as api from "./api-client.js";
 import type { AgentRecord } from "./tui-dashboard.js";
 import { compact, shortId, type AgentRunRecord } from "./tui-model.js";
@@ -13,6 +15,7 @@ export interface HandoffResolution {
   targetProvider?: string;
   context: string;
   goal: string;
+  delegation: RoomTaskDelegationInput;
 }
 
 export type HandoffCommandResult = HandoffResolution | { ok: false; message: string };
@@ -73,6 +76,26 @@ export function resolveHandoffCommand(input: {
     targetProvider: resolveLocalProviderForAgent(targetAgent),
     context,
     goal: `Continue from run ${shortId(sourceRun._id)}: ${sourceGoal}`,
+    delegation: {
+      graphId: sourceRun.delegation_graph_id || randomUUID(),
+      operationId: randomUUID(),
+      ...(sourceRun.delegation_operation_id
+        ? { parentOperationId: sourceRun.delegation_operation_id }
+        : {}),
+      rootHumanOperationId: sourceRun.delegation_root_human_operation_id || randomUUID(),
+      sourceTaskId: sourceRun.delegation_source_task_id || sourceRun._id,
+      role: sourceRun.delegation_operation_id ? "write" : "lead",
+      owningPersonId: "self",
+      sponsoringPersonId: "self",
+      runtimeRevision: sourceRun.delegation_runtime_revision ?? 0,
+      state: "awaitingApproval",
+      riskReasons: ["writer"],
+      dependencyOperationIds: sourceRun.delegation_operation_id
+        ? [sourceRun.delegation_operation_id]
+        : [],
+      approvalId: randomUUID(),
+      visibility: "room",
+    },
   };
 }
 
@@ -134,6 +157,7 @@ export async function executeRoomHandoff(input: {
   targetProvider?: string;
   context: string;
   goal: string;
+  delegation: RoomTaskDelegationInput;
   model?: string;
   dir: string;
   onStatus?: (message: string) => void;
@@ -146,6 +170,7 @@ export async function executeRoomHandoff(input: {
       targetAgentId: input.targetAgentId,
       context: input.context,
       goal: input.goal,
+      delegation: input.delegation,
     },
   );
 

@@ -11,6 +11,7 @@
 // The exec path stays as fallback — if the daemon can't start or a turn
 // fails to dispatch, callers fall back to `codex exec`.
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline";
 import {
@@ -18,6 +19,14 @@ import {
   invokeWorkspaceTool,
   type HarnessWorkspaceAccess,
 } from "../workspace-tools.js";
+import {
+  boundedActivityPayload,
+  type ExecuteOptions,
+  type HarnessNativeReviewRequest,
+  type HarnessPermissionDecision,
+  type HarnessPermissionRequest,
+  type HarnessRuntimeControl,
+} from "./base.js";
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -71,9 +80,51 @@ export class CodexAppServerClient {
 
   /** Spawn + initialize once; concurrent callers share the same handshake. */
   ensureStarted(): Promise<void> {
-    if (this.child && !this.child.killed) return this.starting || Promise.resolve();
-    this.starting = this.start();
-    return this.starting;
+    if (this.child && !this.child.killed && this.child.exitCode === null) {
+      return this.starting || Promise.resolve();
+    }
+    if (this.child) {
+      this.failChild(this.child, new Error("codex app-server exited before restart"));
+    }
+    const starting = this.start();
+    this.starting = starting;
+    void starting.catch(() => {
+      if (this.starting === starting) this.starting = undefined;
+    });
+    return starting;
+  }
+
+  private failChild(child: ChildProcess, error: Error): void {
+    // A stale process can close after a replacement has already started. It
+    // must never reject requests belonging to the replacement.
+    if (this.child !== child) return;
+    this.child = undefined;
+    this.starting = undefined;
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+    this.activeThreads.clear();
+  }
+
+  private writeLine(child: ChildProcess, line: string, context: string): boolean {
+    const input = child.stdin;
+    if (!input?.writable || child.killed || child.exitCode !== null) {
+      this.failChild(child, new Error(`codex app-server ${context} failed: process is not writable`));
+      return false;
+    }
+
+    const fail = (cause: unknown): void => {
+      const detail = cause instanceof Error ? cause.message : String(cause || "unknown write error");
+      this.failChild(child, new Error(`codex app-server ${context} failed: ${detail}`));
+    };
+    try {
+      input.write(line, (error) => {
+        if (error) fail(error);
+      });
+      return true;
+    } catch (error) {
+      fail(error);
+      return false;
+    }
   }
 
   private async start(): Promise<void> {
@@ -88,17 +139,16 @@ export class CodexAppServerClient {
     rl.on("line", (line) => this.handleLine(line));
     child.stderr?.resume(); // drain — codex logs MCP noise here
     child.on("close", () => {
-      const error = new Error("codex app-server exited");
-      for (const pending of this.pending.values()) pending.reject(error);
-      this.pending.clear();
-      this.activeThreads.clear();
-      if (this.child === child) {
-        this.child = undefined;
-        this.starting = undefined;
-      }
+      this.failChild(child, new Error("codex app-server exited"));
     });
-    child.on("error", () => {
-      // Surfaced through the close handler / pending rejections.
+    child.on("error", (error) => {
+      this.failChild(child, new Error(`codex app-server process failed: ${error.message}`));
+    });
+    // Writable streams emit their own `error` event. Without a listener, a
+    // provider that exits between the writability check and write() can crash
+    // the whole Relay with an uncaught EPIPE instead of activating exec fallback.
+    child.stdin?.on("error", (error) => {
+      this.failChild(child, new Error(`codex app-server write failed: ${error.message}`));
     });
 
     await this.request("initialize", {
@@ -106,6 +156,13 @@ export class CodexAppServerClient {
       capabilities: {
         experimentalApi: true,
         requestAttestation: false,
+        mcpServerOpenaiFormElicitation: true,
+        extensions: {
+          "openai/form": {},
+          "io.modelcontextprotocol/ui": {
+            mimeTypes: ["text/html;profile=mcp-app"],
+          },
+        },
       },
     });
     this.notify("initialized");
@@ -172,9 +229,10 @@ export class CodexAppServerClient {
     result?: unknown,
     error?: unknown,
   ): void {
-    if (!this.child?.stdin?.writable) return;
+    const child = this.child;
+    if (!child?.stdin?.writable) return;
     const failure = error as { code?: number; message?: string } | undefined;
-    this.child.stdin.write(`${JSON.stringify({
+    this.writeLine(child, `${JSON.stringify({
       jsonrpc: "2.0",
       id,
       ...(failure ? {
@@ -183,7 +241,7 @@ export class CodexAppServerClient {
           message: String(failure.message || "co·ode tool request failed").slice(0, 2_000),
         },
       } : { result }),
-    })}\n`);
+    })}\n`, "response write");
   }
 
   request(method: string, params: unknown, timeoutMs = REQUEST_TIMEOUT_MS): Promise<unknown> {
@@ -209,7 +267,11 @@ export class CodexAppServerClient {
           reject(error);
         },
       });
-      child.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      this.writeLine(
+        child,
+        `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
+        `${method} request write`,
+      );
     });
   }
 
@@ -218,12 +280,14 @@ export class CodexAppServerClient {
     if (!child || child.killed || !child.stdin?.writable) {
       throw new Error("codex app-server is not running");
     }
-    child.stdin.write(
+    this.writeLine(
+      child,
       `${JSON.stringify({
         jsonrpc: "2.0",
         method,
         ...(params === undefined ? {} : { params }),
       })}\n`,
+      `${method} notification write`,
     );
   }
 
@@ -246,10 +310,14 @@ export class CodexAppServerClient {
   }
 
   dispose(): void {
-    this.child?.kill();
-    this.child = undefined;
-    this.activeThreads.clear();
-    this.starting = undefined;
+    const child = this.child;
+    if (child) {
+      this.failChild(child, new Error("codex app-server disposed"));
+      child.kill();
+    } else {
+      this.activeThreads.clear();
+      this.starting = undefined;
+    }
   }
 }
 
@@ -300,7 +368,15 @@ export interface AppServerTurnOptions {
     },
   ) => void;
   /** Thread items, in app-server shape, with their real lifecycle phase. */
-  onItem?: (item: Record<string, unknown>, phase: "started" | "completed") => void;
+  onItem?: (
+    item: Record<string, unknown>,
+    phase: "started" | "completed",
+    context?: {
+      threadId: string;
+      parentThreadId?: string;
+      isSubagent: boolean;
+    },
+  ) => void;
   client?: CodexAppServerClient;
   /**
    * Per-thread process environment overrides. The daemon stays warm while
@@ -313,6 +389,17 @@ export interface AppServerTurnOptions {
   signal?: AbortSignal;
   /** Run-scoped co·ode automation and task tools. */
   workspaceAccess?: HarnessWorkspaceAccess;
+  /** Bridge native App Server approval requests into the co·ode policy/UI. */
+  permissionMode?: ExecuteOptions["permissionMode"];
+  onPermissionRequest?: (
+    request: HarnessPermissionRequest,
+  ) => HarnessPermissionDecision | Promise<HarnessPermissionDecision>;
+  /** Dispatch through `review/start` instead of a normal turn. */
+  nativeReview?: HarnessNativeReviewRequest;
+  /** Exposes same-turn controls only after App Server returns the active turn id. */
+  onRuntimeControl?: (control: HarnessRuntimeControl | undefined) => void;
+  /** Exact local event evidence; never copy payloads into the Room ledger. */
+  onRawEvent?: ExecuteOptions["onRawEvent"];
 }
 
 export interface AppServerTurnResult {
@@ -341,6 +428,266 @@ export interface AppServerThreadOptions {
 export interface AppServerPreparedThread {
   threadId: string;
   mcpStartupDurationMs: number;
+}
+
+const commandApprovalDecisions = ["accept", "acceptForSession", "decline", "cancel"] as const;
+type CommandApprovalDecision = typeof commandApprovalDecisions[number];
+
+const approvalOption = (decision: CommandApprovalDecision) => ({
+  id: decision,
+  name: decision === "accept" ? "Allow once"
+    : decision === "acceptForSession" ? "Allow for this session"
+      : decision === "cancel" ? "Deny and stop turn"
+        : "Deny",
+  kind: decision === "accept" ? "allow_once" as const
+    : decision === "acceptForSession" ? "allow_always" as const
+      : decision === "cancel" ? "reject_always" as const
+        : "reject_once" as const,
+});
+
+/** Convert the current App Server approval requests into the shared v1 shape. */
+export function codexPermissionRequest(
+  method: string,
+  params: Record<string, unknown>,
+): HarnessPermissionRequest | undefined {
+  const supported = method === "item/commandExecution/requestApproval"
+    || method === "item/fileChange/requestApproval"
+    || method === "item/permissions/requestApproval"
+    || method === "mcpServer/elicitation/request";
+  if (!supported) return undefined;
+  const threadID = typeof params.threadId === "string" ? params.threadId : "";
+  const itemID = typeof params.approvalId === "string"
+    ? params.approvalId
+    : typeof params.itemId === "string" ? params.itemId
+      : typeof params.elicitationId === "string" ? params.elicitationId
+        : method === "mcpServer/elicitation/request"
+          ? `mcp:${createHash("sha256").update(JSON.stringify({
+            serverName: params.serverName,
+            turnId: params.turnId,
+            mode: params.mode,
+            message: params.message,
+            requestedSchema: params.requestedSchema,
+            url: params.url,
+          })).digest("hex").slice(0, 24)}`
+          : "";
+  if (!threadID || !itemID) return undefined;
+  if (method === "item/permissions/requestApproval") {
+    const permissions = params.permissions && typeof params.permissions === "object"
+      ? params.permissions as Record<string, unknown>
+      : {};
+    const network = permissions.network && typeof permissions.network === "object"
+      ? permissions.network as Record<string, unknown>
+      : undefined;
+    return {
+      sessionID: threadID,
+      toolCallID: itemID,
+      title: typeof params.reason === "string" ? params.reason : "Grant additional sandbox permissions",
+      tool: "permission_profile",
+      kind: "permission",
+      scope: network?.enabled === true ? "externalAction" : "workspace",
+      input: boundedActivityPayload({
+        permissions,
+        ...(typeof params.cwd === "string" ? { cwd: params.cwd } : {}),
+      }),
+      options: [
+        { id: "grantTurn", name: "Allow for this turn", kind: "allow_once" },
+        { id: "deny", name: "Deny", kind: "reject_once" },
+      ],
+    };
+  }
+  if (method === "mcpServer/elicitation/request") {
+    const mode = typeof params.mode === "string" ? params.mode : "form";
+    const requestedSchema = params.requestedSchema
+      && typeof params.requestedSchema === "object"
+      && !Array.isArray(params.requestedSchema)
+      ? params.requestedSchema as Record<string, unknown>
+      : undefined;
+    const url = mode === "url" && typeof params.url === "string"
+      && /^https:\/\//i.test(params.url) ? params.url.slice(0, 4_096) : undefined;
+    return {
+      sessionID: threadID,
+      toolCallID: itemID,
+      title: typeof params.message === "string" ? params.message : "MCP server requests input",
+      tool: typeof params.serverName === "string" ? params.serverName : "mcp",
+      kind: "elicitation",
+      scope: "externalAction",
+      ...(requestedSchema ? { requestedSchema } : {}),
+      ...(url ? { url } : {}),
+      input: boundedActivityPayload({
+        mode: params.mode,
+        requestedFields: requestedSchema?.properties
+          && typeof requestedSchema.properties === "object"
+          && !Array.isArray(requestedSchema.properties)
+          ? Object.keys(requestedSchema.properties as Record<string, unknown>).slice(0, 100)
+          : [],
+      }),
+      options: [
+        { id: "accept", name: mode === "url" ? "Continue" : "Submit", kind: "allow_once" },
+        { id: "decline", name: "Decline", kind: "reject_once" },
+        { id: "cancel", name: "Cancel turn", kind: "reject_always" },
+      ],
+    };
+  }
+  const command = typeof params.command === "string" ? params.command : undefined;
+  const reason = typeof params.reason === "string" ? params.reason : undefined;
+  const available = Array.isArray(params.availableDecisions)
+    ? params.availableDecisions.filter((candidate): candidate is CommandApprovalDecision =>
+      typeof candidate === "string"
+      && commandApprovalDecisions.includes(candidate as CommandApprovalDecision)
+    )
+    : [...commandApprovalDecisions];
+  const decisions = available.length > 0 ? available : ["decline" as const];
+  return {
+    sessionID: threadID,
+    toolCallID: itemID,
+    title: method === "item/fileChange/requestApproval"
+      ? reason || "Apply file changes"
+      : reason || command || "Run command",
+    tool: method === "item/fileChange/requestApproval" ? "file_change" : "command_execution",
+    kind: method === "item/fileChange/requestApproval" ? "edit" : "execute",
+    input: boundedActivityPayload({
+      ...(command ? { command } : {}),
+      ...(typeof params.cwd === "string" ? { cwd: params.cwd } : {}),
+      ...(reason ? { reason } : {}),
+      ...(params.additionalPermissions ? { additionalPermissions: params.additionalPermissions } : {}),
+    }),
+    scope: "workspace",
+    options: decisions.map(approvalOption),
+  };
+}
+
+const elicitationOptions = (schema: Record<string, unknown>): string[] | undefined => {
+  if (Array.isArray(schema.enum)) {
+    return schema.enum.filter((value): value is string => typeof value === "string");
+  }
+  if (Array.isArray(schema.oneOf)) {
+    return schema.oneOf.flatMap((value) => value && typeof value === "object"
+      && typeof (value as Record<string, unknown>).const === "string"
+      ? [String((value as Record<string, unknown>).const)] : []);
+  }
+  const items = schema.items && typeof schema.items === "object"
+    ? schema.items as Record<string, unknown> : undefined;
+  if (items && Array.isArray(items.enum)) {
+    return items.enum.filter((value): value is string => typeof value === "string");
+  }
+  if (items && Array.isArray(items.anyOf)) {
+    return items.anyOf.flatMap((value) => value && typeof value === "object"
+      && typeof (value as Record<string, unknown>).const === "string"
+      ? [String((value as Record<string, unknown>).const)] : []);
+  }
+  return undefined;
+};
+
+/** Validate and bound typed MCP form content before it crosses back into App Server. */
+export function validateMcpElicitationContent(
+  schema: Record<string, unknown>,
+  content: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (schema.type !== "object" || !content || Array.isArray(content)) return undefined;
+  const properties = schema.properties && typeof schema.properties === "object"
+    && !Array.isArray(schema.properties)
+    ? schema.properties as Record<string, unknown> : {};
+  const required = new Set(Array.isArray(schema.required)
+    ? schema.required.filter((value): value is string => typeof value === "string") : []);
+  const result: Record<string, unknown> = {};
+  for (const key of required) if (!(key in content)) return undefined;
+  for (const [key, raw] of Object.entries(content)) {
+    const property = properties[key];
+    if (!property || typeof property !== "object" || Array.isArray(property)) return undefined;
+    const definition = property as Record<string, unknown>;
+    const type = definition.type;
+    if (type === "string") {
+      if (typeof raw !== "string") return undefined;
+      if (Number.isFinite(Number(definition.minLength)) && raw.length < Number(definition.minLength)) return undefined;
+      if (Number.isFinite(Number(definition.maxLength)) && raw.length > Number(definition.maxLength)) return undefined;
+      const options = elicitationOptions(definition);
+      if (options && !options.includes(raw)) return undefined;
+      result[key] = raw.slice(0, 16_000);
+    } else if (type === "number" || type === "integer") {
+      if (typeof raw !== "number" || !Number.isFinite(raw)) return undefined;
+      if (type === "integer" && !Number.isInteger(raw)) return undefined;
+      if (Number.isFinite(Number(definition.minimum)) && raw < Number(definition.minimum)) return undefined;
+      if (Number.isFinite(Number(definition.maximum)) && raw > Number(definition.maximum)) return undefined;
+      result[key] = raw;
+    } else if (type === "boolean") {
+      if (typeof raw !== "boolean") return undefined;
+      result[key] = raw;
+    } else if (type === "array") {
+      if (!Array.isArray(raw) || !raw.every((value) => typeof value === "string")) return undefined;
+      if (Number.isFinite(Number(definition.minItems)) && raw.length < Number(definition.minItems)) return undefined;
+      if (Number.isFinite(Number(definition.maxItems)) && raw.length > Number(definition.maxItems)) return undefined;
+      const options = elicitationOptions(definition);
+      if (options && raw.some((value) => !options.includes(value))) return undefined;
+      result[key] = raw.slice(0, 100).map((value) => value.slice(0, 4_096));
+    } else {
+      return undefined;
+    }
+  }
+  return JSON.stringify(result).length <= 32 * 1_024 ? result : undefined;
+}
+
+export function codexPermissionDecision(
+  request: HarnessPermissionRequest,
+  mode: ExecuteOptions["permissionMode"],
+): HarnessPermissionDecision {
+  const matching = mode === "fullAccess"
+    ? request.options.find((option) => option.kind === "allow_always")
+      || request.options.find((option) => option.kind === "allow_once")
+    : mode === "approve"
+      ? request.options.find((option) => option.kind === "allow_once")
+      : mode === "plan"
+        ? request.options.find((option) => option.kind === "reject_always")
+          || request.options.find((option) => option.kind === "reject_once")
+        : request.options.find((option) => option.kind === "reject_once")
+          || request.options.find((option) => option.kind === "reject_always");
+  return matching
+    ? { outcome: "selected", optionID: matching.id }
+    : { outcome: "cancelled" };
+}
+
+async function codexApprovalResponse(
+  method: string,
+  params: Record<string, unknown>,
+  options: AppServerTurnOptions,
+): Promise<Record<string, unknown> | undefined> {
+  const request = codexPermissionRequest(method, params);
+  if (!request) return undefined;
+  const decision = options.signal?.aborted
+    ? { outcome: "cancelled" as const }
+    : options.onPermissionRequest
+      ? await options.onPermissionRequest(request)
+      : codexPermissionDecision(request, options.permissionMode);
+  const selected = decision.outcome === "selected"
+    ? request.options.find((option) => option.id === decision.optionID)
+    : undefined;
+  const nativeDecision = selected?.id;
+  if (method === "item/permissions/requestApproval") {
+    const granted = nativeDecision === "grantTurn"
+      && params.permissions && typeof params.permissions === "object"
+      ? params.permissions as Record<string, unknown>
+      : {};
+    return { permissions: granted, scope: "turn" };
+  }
+  if (method === "mcpServer/elicitation/request") {
+    if (nativeDecision === "accept") {
+      if (params.mode === "url") return { action: "accept", content: null, _meta: null };
+      const schema = params.requestedSchema && typeof params.requestedSchema === "object"
+        ? params.requestedSchema as Record<string, unknown> : undefined;
+      const content = schema
+        ? validateMcpElicitationContent(schema, decision.outcome === "selected" ? decision.content : undefined)
+        : undefined;
+      if (content) return { action: "accept", content, _meta: null };
+    }
+    return {
+      action: nativeDecision === "cancel" ? "cancel" : "decline",
+      content: null,
+      _meta: null,
+    };
+  }
+  if (nativeDecision && commandApprovalDecisions.includes(nativeDecision as CommandApprovalDecision)) {
+    return { decision: nativeDecision as CommandApprovalDecision };
+  }
+  return { decision: request.options.some((option) => option.id === "decline") ? "decline" : "cancel" };
 }
 
 export function codexThreadConfig(
@@ -537,7 +884,14 @@ export async function runCodexAppServerTurn(
     let finalMessage = "";
     let settled = false;
     let turnId: string | undefined;
+    let activeThreadId = threadId;
+    let runtimeControlPublished = false;
     const messagePhases = new Map<string, "commentary" | "final_answer">();
+    // Codex runs delegated work in child threads. The app-server publishes
+    // their tool notifications on the same connection, so retain the lineage
+    // announced by the parent instead of dropping everything whose thread id
+    // differs from the root turn.
+    const subagentParents = new Map<string, string>();
     const timeoutMs = options.turnTimeoutMs ?? DEFAULT_CODEX_TURN_TIMEOUT_MS;
     let timeout: NodeJS.Timeout | undefined;
     let off = () => {};
@@ -546,6 +900,10 @@ export async function runCodexAppServerTurn(
     const cleanup = () => {
       if (timeout) clearTimeout(timeout);
       options.signal?.removeEventListener("abort", abortTurn);
+      if (runtimeControlPublished) {
+        runtimeControlPublished = false;
+        options.onRuntimeControl?.(undefined);
+      }
       off();
       offRequest();
     };
@@ -558,7 +916,7 @@ export async function runCodexAppServerTurn(
       cleanup();
       if (turnId) {
         await server.request("turn/interrupt", {
-          threadId,
+          threadId: activeThreadId,
           turnId,
         }, TURN_INTERRUPT_TIMEOUT_MS).catch(() => {});
       }
@@ -574,8 +932,19 @@ export async function runCodexAppServerTurn(
 
     off = server.onNotification((method, params) => {
       if (settled) return;
-      if ((params.threadId as string | undefined) !== threadId) return;
+      const notificationThreadId = params.threadId as string | undefined;
+      if (!notificationThreadId) return;
+      const isRootThread = notificationThreadId === activeThreadId;
+      const parentThreadId = subagentParents.get(notificationThreadId);
+      if (!isRootThread && !parentThreadId) return;
+      void options.onRawEvent?.({
+        observedAt: new Date().toISOString(),
+        direction: "providerToCoode",
+        channel: "protocol",
+        payload: { method, params },
+      });
       if (method === "item/agentMessage/delta") {
+        if (!isRootThread) return;
         const itemId = params.itemId as string | undefined;
         options.onDelta?.((params.delta as string) || "", {
           itemId,
@@ -584,6 +953,7 @@ export async function runCodexAppServerTurn(
         return;
       }
       if (method === "item/reasoning/summaryTextDelta") {
+        if (!isRootThread) return;
         options.onReasoningSummaryDelta?.((params.delta as string) || "", {
           itemId: params.itemId as string | undefined,
           summaryIndex: typeof params.summaryIndex === "number"
@@ -596,19 +966,38 @@ export async function runCodexAppServerTurn(
         const item = params.item as Record<string, unknown> | undefined;
         if (!item) return;
         const phase = method === "item/started" ? "started" : "completed";
-        if (item.type === "agentMessage" && typeof item.id === "string") {
+        if (isRootThread
+            && item.type === "subAgentActivity"
+            && typeof item.agentThreadId === "string") {
+          subagentParents.set(item.agentThreadId, activeThreadId!);
+        }
+        if (isRootThread && item.type === "agentMessage" && typeof item.id === "string") {
           const messagePhase = item.phase;
           if (messagePhase === "commentary" || messagePhase === "final_answer") {
             messagePhases.set(item.id, messagePhase);
           }
         }
-        if (phase === "completed" && item.type === "agentMessage" && typeof item.text === "string") {
+        if (isRootThread
+            && phase === "completed"
+            && item.type === "agentMessage"
+            && typeof item.text === "string") {
           finalMessage = item.text;
         }
-        options.onItem?.(item, phase);
+        if (isRootThread
+            && phase === "completed"
+            && item.type === "exitedReviewMode"
+            && typeof item.review === "string") {
+          finalMessage = item.review;
+        }
+        options.onItem?.(item, phase, {
+          threadId: notificationThreadId,
+          ...(parentThreadId ? { parentThreadId } : {}),
+          isSubagent: !isRootThread,
+        });
         return;
       }
       if (method === "turn/completed") {
+        if (!isRootThread) return;
         settled = true;
         cleanup();
         const turn = params.turn as { status?: string; error?: { message?: string } } | undefined;
@@ -616,7 +1005,7 @@ export async function runCodexAppServerTurn(
         resolve({
           exitCode: failed ? 1 : 0,
           finalMessage,
-          threadId: threadId!,
+          threadId: activeThreadId!,
           errorMessage: failed
             ? turn?.error?.message || (turn?.status === "interrupted" ? "turn interrupted" : "turn failed")
             : undefined,
@@ -625,8 +1014,16 @@ export async function runCodexAppServerTurn(
     });
 
     offRequest = server.onRequest((method, params) => {
+      void options.onRawEvent?.({
+        observedAt: new Date().toISOString(),
+        direction: "providerToCoode",
+        channel: "protocol",
+        payload: { method, params },
+      });
+      const approval = codexApprovalResponse(method, params, options);
+      if (codexPermissionRequest(method, params)) return approval;
       if (method !== "item/tool/call" || !options.workspaceAccess) return undefined;
-      if ((params.threadId as string | undefined) !== threadId) return undefined;
+      if ((params.threadId as string | undefined) !== activeThreadId) return undefined;
       if ((params.namespace as string | null | undefined) !== "coode") return undefined;
       const tool = typeof params.tool === "string" ? params.tool : "";
       const argumentsValue = params.arguments;
@@ -662,22 +1059,77 @@ export async function runCodexAppServerTurn(
       }, timeoutMs);
     }
 
-    server.request("turn/start", {
-      threadId,
-      input: [{ type: "text", text: goal }],
-      cwd: options.workDir,
-      ...(options.model ? { model: options.model } : {}),
-      ...(options.effort ? { effort: options.effort } : {}),
-      ...(options.speed === "fast" ? { serviceTier: "fast" } : {}),
-      summary: "concise",
-      approvalPolicy: options.approvalPolicy ?? "never",
-    }).then((result) => {
-      turnId = (result as { turn?: { id?: string } })?.turn?.id;
+    const dispatchMethod = options.nativeReview ? "review/start" : "turn/start";
+    const dispatchParams = options.nativeReview
+      ? {
+        threadId,
+        target: options.nativeReview.target,
+        delivery: options.nativeReview.delivery ?? "detached",
+      }
+      : {
+        threadId,
+        input: [{ type: "text", text: goal }],
+        cwd: options.workDir,
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.effort ? { effort: options.effort } : {}),
+        ...(options.speed === "fast" ? { serviceTier: "fast" } : {}),
+        summary: "concise",
+        approvalPolicy: options.approvalPolicy ?? "never",
+      };
+    void options.onRawEvent?.({
+      observedAt: new Date().toISOString(),
+      direction: "coodeToProvider",
+      channel: "protocol",
+      payload: { method: dispatchMethod, params: dispatchParams },
+    });
+    server.request(dispatchMethod, dispatchParams).then((result) => {
+      void options.onRawEvent?.({
+        observedAt: new Date().toISOString(),
+        direction: "providerToCoode",
+        channel: "protocol",
+        payload: { method: dispatchMethod, result },
+      });
+      const dispatched = result as { turn?: { id?: string }; reviewThreadId?: string };
+      turnId = dispatched.turn?.id;
+      if (options.nativeReview && dispatched.reviewThreadId) {
+        activeThreadId = dispatched.reviewThreadId;
+        server.markThreadActive(activeThreadId, runtimeSignature);
+      }
       if (!turnId && !settled) {
         void terminate(new CodexAppServerTurnTerminatedError(
           "Codex accepted the turn but did not return a turn identifier.",
           "codex_turn_dispatch_failed",
         ));
+        return;
+      }
+      if (!settled && turnId) {
+        runtimeControlPublished = true;
+        options.onRuntimeControl?.({
+          harness: "codex",
+          providerSessionID: activeThreadId!,
+          providerTurnID: turnId,
+          steer: async (text) => {
+            const params = {
+              threadId: activeThreadId,
+              expectedTurnId: turnId,
+              input: [{ type: "text", text }],
+            };
+            void options.onRawEvent?.({
+              observedAt: new Date().toISOString(),
+              direction: "coodeToProvider",
+              channel: "protocol",
+              payload: { method: "turn/steer", params },
+            });
+            const response = await server.request("turn/steer", params) as { turnId?: string };
+            void options.onRawEvent?.({
+              observedAt: new Date().toISOString(),
+              direction: "providerToCoode",
+              channel: "protocol",
+              payload: { method: "turn/steer", result: response },
+            });
+            return { providerTurnID: response.turnId || turnId! };
+          },
+        });
       }
     }).catch((error: Error) => {
       if (settled) return;

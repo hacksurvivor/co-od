@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -9,7 +9,11 @@ import {
 } from "../dist/tui-opentui-preview.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(scriptDir, "..", "..", "..");
+const monorepoRoot = join(scriptDir, "..", "..", "..");
+const packageRoot = join(scriptDir, "..");
+const repoRoot = existsSync(join(monorepoRoot, "pnpm-workspace.yaml"))
+  ? monorepoRoot
+  : packageRoot;
 const outDir = join(repoRoot, "docs", "release", "artifacts", "tui-experience");
 const fixtureNow = Date.UTC(2026, 5, 29, 12, 0, 0);
 const configuredFormatOptions = {

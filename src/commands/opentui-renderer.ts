@@ -1495,6 +1495,7 @@ async function runHandoff(
       targetProvider: resolution.targetProvider,
       context: resolution.context,
       goal: resolution.goal,
+      delegation: resolution.delegation,
       model: resolution.targetProvider === state.dashboard.provider ? state.model : undefined,
       dir: state.args.dir,
       onStatus: (message) => {

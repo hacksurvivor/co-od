@@ -48,7 +48,7 @@ test("buildDoctorReport reports OpenTUI default readiness through Bun", () => {
   assert.equal(report.checks.find((check) => check.id === "room-config")?.ok, false);
   assert.equal(report.strictReady, false);
   assert.deepEqual(strictDoctorFailures(report).map((check) => check.id), ["live-session", "room-config"]);
-  assert.match(report.installHint, /pnpm build/);
+  assert.match(report.installHint, /pnpm -C packages\/cli build/);
   assert.deepEqual(report.cachePolicy, { enabled: true, maxAgeMs: 604_800_000 });
 });
 
@@ -186,8 +186,9 @@ test("buildDoctorReport reports live QA readiness when login and room config exi
   assert.match(report.checks.find((check) => check.id === "room-config")?.detail || "", /Beta Room/);
   assert.equal(report.checks.find((check) => check.id === "provider-opencode")?.ok, true);
   assert.match(report.checks.find((check) => check.id === "provider-opencode")?.detail || "", /custom-opencode/);
-  assert.equal(report.checks.find((check) => check.id === "provider-openclaw")?.ok, true);
-  assert.match(report.checks.find((check) => check.id === "provider-openclaw")?.detail || "", /zeroclaw/);
+  assert.equal(report.checks.find((check) => check.id === "provider-openclaw")?.ok, false);
+  assert.equal(report.checks.find((check) => check.id === "provider-zeroclaw")?.ok, true);
+  assert.match(report.checks.find((check) => check.id === "provider-zeroclaw")?.detail || "", /zeroclaw/);
   assert.equal(report.strictReady, true);
   assert.deepEqual(strictDoctorFailures(report), []);
 });

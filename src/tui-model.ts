@@ -11,6 +11,25 @@ export interface AgentRunRecord {
   handoff_from?: string;
   handoff_context?: string;
   join_summary_md?: string;
+  delegation_graph_id?: string;
+  delegation_operation_id?: string;
+  delegation_parent_operation_id?: string;
+  delegation_root_human_operation_id?: string;
+  delegation_source_task_id?: string;
+  delegation_role?: "lead" | "research" | "review" | "write" | "arbitrate";
+  delegation_owning_person_id?: string;
+  delegation_sponsoring_person_id?: string;
+  delegation_runtime_revision?: number;
+  delegation_state?: string;
+  delegation_risk_reasons?: string[];
+  delegation_dependency_operation_ids?: string[];
+  delegation_workspace_id?: string;
+  delegation_writer_lease_id?: string;
+  delegation_current_action?: string;
+  delegation_progress_summary?: string;
+  delegation_result_summary?: string;
+  delegation_visibility?: string;
+  delegation_approval_id?: string;
   created_at?: number;
   started_at?: number;
   finished_at?: number;
@@ -206,6 +225,14 @@ export function formatStepDescription(step: AgentRunStepRecord): string {
 }
 
 export function findDelegationRoot(run: AgentRunRecord, allRuns: AgentRunRecord[]): AgentRunRecord {
+  if (run.delegation_graph_id) {
+    const graphRuns = allRuns.filter((candidate) =>
+      candidate.delegation_graph_id === run.delegation_graph_id
+    );
+    return graphRuns.find((candidate) => candidate.delegation_role === "lead")
+      || graphRuns.find((candidate) => !candidate.delegation_parent_operation_id)
+      || run;
+  }
   const byId = new Map(allRuns.map((candidate) => [candidate._id, candidate]));
   let current = run;
   const seen = new Set<string>();
@@ -221,6 +248,18 @@ export function findDelegationRoot(run: AgentRunRecord, allRuns: AgentRunRecord[
 
 export function buildDelegationRows(run: AgentRunRecord, allRuns: AgentRunRecord[]): DelegationRow[] {
   const root = findDelegationRoot(run, allRuns);
+  if (run.delegation_graph_id) {
+    const graphRuns = allRuns.filter((candidate) =>
+      candidate.delegation_graph_id === run.delegation_graph_id
+    );
+    return appendCanonicalDelegationRows({
+      run: root,
+      selectedRunId: run._id,
+      graphRuns,
+      depth: 0,
+      seen: new Set<string>(),
+    });
+  }
   return appendDelegationRows({
     run: root,
     selectedRunId: run._id,
@@ -229,6 +268,54 @@ export function buildDelegationRows(run: AgentRunRecord, allRuns: AgentRunRecord
     relation: "root",
     seen: new Set<string>(),
   });
+}
+
+function appendCanonicalDelegationRows(input: {
+  run: AgentRunRecord;
+  selectedRunId: string;
+  graphRuns: AgentRunRecord[];
+  depth: number;
+  seen: Set<string>;
+}): DelegationRow[] {
+  const { run, selectedRunId, graphRuns, depth, seen } = input;
+  if (seen.has(run._id)) {
+    return [{
+      runId: run._id,
+      status: run.delegation_state || run.status,
+      agentId: run.agent_id,
+      role: run.delegation_role,
+      goal: run.delegation_current_action || run.goal,
+      depth,
+      relation: "cycle",
+      selected: run._id === selectedRunId,
+    }];
+  }
+  const nextSeen = new Set(seen);
+  nextSeen.add(run._id);
+  const rows: DelegationRow[] = [{
+    runId: run._id,
+    status: run.delegation_state || run.status,
+    agentId: run.agent_id,
+    role: run.delegation_role,
+    goal: run.delegation_current_action || run.delegation_progress_summary || run.goal,
+    depth,
+    relation: depth === 0 ? "root" : (run.handoff_from ? "handoff" : "spawn"),
+    selected: run._id === selectedRunId,
+  }];
+  const operationID = run.delegation_operation_id;
+  const children = graphRuns
+    .filter((candidate) => candidate.delegation_parent_operation_id === operationID)
+    .sort((left, right) => (left.created_at || 0) - (right.created_at || 0));
+  for (const child of children) {
+    rows.push(...appendCanonicalDelegationRows({
+      run: child,
+      selectedRunId,
+      graphRuns,
+      depth: depth + 1,
+      seen: nextSeen,
+    }));
+  }
+  return rows;
 }
 
 function appendDelegationRows(input: {

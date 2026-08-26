@@ -42,10 +42,18 @@ export const resolveRemoteCliAdapterProvider = (provider?: string): string => {
     case "local_opencode":
       return "opencode";
     case "openclaw":
-    case "zeroclaw":
     case "local-openclaw":
     case "local_openclaw":
       return "openclaw";
+    case "zeroclaw":
+    case "local-zeroclaw":
+    case "local_zeroclaw":
+      return "zeroclaw";
+    case "pi":
+    case "pi-agent":
+    case "local-pi":
+    case "local_pi":
+      return "pi";
     case "hermes":
     case "hermes-agent":
     case "local-hermes":
@@ -63,7 +71,7 @@ export const resolveRemoteCliAdapterProvider = (provider?: string): string => {
       return "claude";
     default:
       throw new Error(
-        `Unsupported remote CLI provider "${provider}". Supported remote CLI providers: claude, codex, hermes, opencode, openclaw.`,
+        `Unsupported remote CLI provider "${provider}". Supported remote CLI providers: claude, codex, hermes, opencode, openclaw, pi, zeroclaw.`,
       );
   }
 };

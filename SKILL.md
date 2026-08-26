@@ -1,12 +1,12 @@
 ---
 name: co-od
-description: Open-source CLI for connecting local development environments to co-od rooms
+description: CLI for connecting local dev environments to co-ode rooms
 version: 0.2.0
 ---
 
 # co-od CLI
 
-Run coding agents together in co-od rooms from the command line.
+Run AI agents in co-ode rooms from the command line.
 
 ## Commands
 
@@ -27,7 +27,8 @@ Run coding agents together in co-od rooms from the command line.
 
 ## Terminal Workspace
 
-The default local experience is the TUI. Start with `co-od` or `co-od tui`.
+The default local experience is the TUI. Browser files stay in `apps/web`, but
+terminal work should prefer `co-od` or `co-od tui` first.
 
 Offline room dashboard fallback is enabled by default for recent room data.
 Use `CO_OD_TUI_DISABLE_DASHBOARD_CACHE=true` to disable cached dashboard data or
@@ -48,8 +49,9 @@ Useful slash commands inside the TUI:
   `/agent-resume`
 - `/safety`, `/safety audit`, `/safety toggle`, `/undo`
 
-Run `pnpm verify:tui` from the repo root before shipping TUI changes. The gate
-smokes the default Node renderer, `co-od opentui`, and
+Run `pnpm verify:tui` from the repo root, or
+`pnpm -C packages/cli run verify:tui` from any directory, before shipping TUI
+changes. The gate smokes the default Node renderer, `co-od opentui`, and
 `co-od tui --renderer opentui`.
 
 Run `pnpm release:tui -- --room <room-id>` only when a configured beta room is
@@ -64,12 +66,31 @@ the guarded disposable mutation scenarios.
 
 ## Provider Support
 
-Use `--provider claude|codex|opencode|openclaw|zeroclaw` on `tui`, `run`, `daemon`, and `share` commands.
+Use `--provider antigravity|claude|codex|gemini|grok|hermes|opencode|openclaw|pi|zeroclaw|custom`
+on `tui`, `run`, `daemon`, and `share` commands.
 
-- `claude` (default) -- spawns `claude -p --dangerously-skip-permissions`
-- `codex` -- spawns `codex exec --full-auto`
-- `opencode` -- spawns `opencode run <goal>`
-- `openclaw` / `zeroclaw` -- spawns the OpenClaw-compatible local CLI
+co·ode preserves each harness's native transport instead of reducing every
+provider to plain stdout:
+
+- Codex App Server: persistent threads, same-turn steering, typed MCP
+  elicitation, native reviews, usage, and task archive controls.
+- Claude stream JSON: persistent foreground sessions plus background-agent
+  list, dispatch, logs, stop, respawn, and removal.
+- Gemini, Hermes, OpenCode, OpenClaw, and ZeroClaw: ACP negotiation, streaming
+  activity, approvals, attachments, session continuation, and exact capability
+  receipts when the provider exposes them.
+- Pi RPC: streaming events, in-flight steering, queueing, extension dialogs,
+  and session state.
+- Grok: native ACP by default, with explicit best-of-N and self-check headless
+  modes selected from the execution profile.
+- Antigravity: version-gated structured JSON events (1.1.8+) with safe plain
+  output fallback on older versions.
+- Custom: argv-only launch templates and optional Ed25519-signed conformance
+  manifests that pin the executable, version output, signer, and capabilities.
+
+External sends and hardware operations always require an exact one-time grant.
+Provider credentials, raw provider IDs, typed form answers, OTPs, and raw event
+payloads are never written to Room history.
 
 ## Usage with Claude Code
 

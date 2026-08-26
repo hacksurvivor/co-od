@@ -1,4 +1,9 @@
-import { executeRoomTask, type ExecuteRoomTaskOptions, type RoomTaskResult } from "./commands/run.js";
+import {
+  executeRoomTask,
+  type ExecuteRoomTaskOptions,
+  type RoomTaskDelegationInput,
+  type RoomTaskResult,
+} from "./commands/run.js";
 import type { ProviderSessionContext } from "./adapters/base.js";
 import type { TuiAttachmentTransport } from "./tui-attachments.js";
 
@@ -21,6 +26,7 @@ export interface RunTuiTaskOptions {
   attachments?: TuiAttachmentTransport[];
   continueRunId?: string;
   providerSession?: ProviderSessionContext;
+  delegation?: RoomTaskDelegationInput;
   executeTask?: TuiTaskExecutor;
   onEvent?: (event: TuiTaskEvent) => void;
 }
@@ -51,6 +57,7 @@ export async function runTuiTask(options: RunTuiTaskOptions): Promise<TuiTaskRun
       attachments: options.attachments,
       continueRunId: options.continueRunId,
       providerSession: options.providerSession,
+      delegation: options.delegation,
       onStatus: (message) => options.onEvent?.({ type: "status", message }),
       onOutput: (data) => options.onEvent?.({ type: "output", data }),
     });

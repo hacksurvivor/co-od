@@ -1,4 +1,4 @@
-export const TUI_PROVIDERS = ["opencode", "codex", "claude", "hermes", "openclaw"];
+export const TUI_PROVIDERS = ["opencode", "codex", "claude", "hermes", "openclaw", "pi", "zeroclaw"];
 
 export interface ProviderState {
   provider: string;

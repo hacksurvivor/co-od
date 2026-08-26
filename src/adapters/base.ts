@@ -11,17 +11,258 @@ export interface AgentAdapter {
   capabilities: HarnessCapabilities;
   available(): Promise<boolean>;
   execute(goal: string, options: ExecuteOptions): Promise<ExecuteResult>;
+  nativeSessionState?: HarnessNativeSessionState;
+  backgroundAgents?: HarnessBackgroundAgentService;
+  nativeControls?: HarnessNativeControlService;
   dispose?(): void | Promise<void>;
 }
 
-export const HARNESS_CONTRACT_VERSION = 0;
+export type HarnessDelegationToolName =
+  | "proposeDelegation"
+  | "cancelDelegation"
+  | "joinDelegation";
+
+export interface HarnessDelegationToolCall {
+  name: HarnessDelegationToolName;
+  input: Record<string, unknown>;
+}
+
+/**
+ * A structured co·ode-owned delegation bridge. Adapters may expose this as a
+ * native tool, but must never treat transcript prose as a graph mutation.
+ */
+export interface HarnessDelegationBridge {
+  graphId: string;
+  leadOperationId: string;
+  tools: readonly HarnessDelegationToolName[];
+  invoke(call: HarnessDelegationToolCall): Promise<Record<string, unknown>>;
+}
+
+export type HarnessNativeControlActionRisk = "safe" | "destructive" | "privileged";
+
+export interface HarnessNativeControlAction {
+  id: string;
+  title: string;
+  risk: HarnessNativeControlActionRisk;
+  /** Exact confirmation phrase required for destructive or privileged actions. */
+  confirmation?: string;
+  /** Optional short string input, such as a one-time provider OTP. */
+  inputLabel?: string;
+}
+
+export interface HarnessNativeControlItem {
+  id: string;
+  title: string;
+  detail?: string;
+  status?: "ready" | "working" | "attention" | "unavailable" | "unknown";
+  providerID?: string;
+  actions?: HarnessNativeControlAction[];
+}
+
+export interface HarnessNativeControlGroup {
+  id: string;
+  title: string;
+  detail?: string;
+  items: HarnessNativeControlItem[];
+}
+
+export interface HarnessNativeControlSnapshot {
+  contractVersion: 1;
+  harness: string;
+  observedAt: string;
+  version?: string;
+  groups: HarnessNativeControlGroup[];
+}
+
+export interface HarnessNativeControlContext {
+  workDir: string;
+  providerSessionID?: string;
+}
+
+export interface HarnessNativeControlService {
+  snapshot(context: HarnessNativeControlContext): Promise<HarnessNativeControlSnapshot>;
+  perform?(
+    context: HarnessNativeControlContext,
+    actionID: string,
+    providerID?: string,
+    input?: string,
+  ): Promise<HarnessNativeControlSnapshot>;
+}
+
+export interface HarnessBackgroundAgentSummary {
+  id: string;
+  name?: string;
+  status?: string;
+  workDir?: string;
+  providerSessionID?: string;
+  raw?: Record<string, unknown>;
+}
+
+export type HarnessBackgroundAgentAction = "logs" | "stop" | "respawn" | "remove";
+
+export interface HarnessBackgroundAgentControlResult {
+  agent: HarnessBackgroundAgentSummary;
+  /** Bounded recent provider output. Present only for the explicit logs action. */
+  output?: string;
+}
+
+export interface HarnessBackgroundAgentService {
+  list(workDir: string, includeCompleted?: boolean): Promise<HarnessBackgroundAgentSummary[]>;
+  dispatch(
+    goal: string,
+    options: Pick<ExecuteOptions, "workDir" | "model" | "effort" | "permissionMode">,
+  ): Promise<HarnessBackgroundAgentSummary>;
+  control(
+    action: HarnessBackgroundAgentAction,
+    agentID: string,
+    workDir: string,
+  ): Promise<HarnessBackgroundAgentControlResult>;
+}
+
+export interface HarnessNativeSessionStateContext {
+  workDir: string;
+  providerSessionID: string;
+}
+
+export interface HarnessNativeSessionState {
+  diff(context: HarnessNativeSessionStateContext, messageID?: string): Promise<unknown>;
+  revert(
+    context: HarnessNativeSessionStateContext,
+    messageID: string,
+    partID?: string,
+  ): Promise<boolean>;
+  unrevert(context: HarnessNativeSessionStateContext): Promise<boolean>;
+  project?(context: HarnessNativeSessionStateContext): Promise<HarnessNativeSessionProjection>;
+}
+
+export interface HarnessNativeChildSession {
+  fingerprint: string;
+  title?: string;
+  status?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface HarnessNativeTodo {
+  id?: string;
+  content: string;
+  status?: string;
+  priority?: string;
+}
+
+export interface HarnessNativeSessionProjection {
+  childSessions: HarnessNativeChildSession[];
+  todos: HarnessNativeTodo[];
+}
+
+export const HARNESS_CONTRACT_VERSION = 1;
+
+export type HarnessTransportKind =
+  | "acp"
+  | "appServer"
+  | "jsonl"
+  | "plainText"
+  | "sdk"
+  | "custom";
+
+export interface HarnessTransportCapabilities {
+  kind: HarnessTransportKind;
+  protocolVersion?: number;
+  capabilityNegotiation: boolean;
+  structuredEvents: boolean;
+}
+
+export interface HarnessPermissionOption {
+  id: string;
+  name: string;
+  kind: "allow_once" | "allow_always" | "reject_once" | "reject_always";
+}
+
+export interface HarnessPermissionRequest {
+  sessionID: string;
+  toolCallID: string;
+  title: string;
+  tool?: string;
+  kind?: string;
+  input?: string;
+  /** The authority boundary the provider is asking co·ode to cross. */
+  scope?: "workspace" | "externalAction";
+  /** Provider-owned JSON Schema for a typed MCP elicitation form. */
+  requestedSchema?: Record<string, unknown>;
+  /** Provider-owned URL for an explicit user-completed authorization flow. */
+  url?: string;
+  /** Exact recipient or hardware authority covered by a one-time external grant. */
+  authorityTarget?: HarnessAuthorityTarget;
+  options: HarnessPermissionOption[];
+}
+
+export interface HarnessAuthorityTarget {
+  kind: "recipient" | "hardware";
+  operation: string;
+  recipient?: string;
+  channel?: string;
+  hardware?: string;
+}
+
+export type HarnessElicitationContent = Record<string, unknown>;
+
+export type HarnessPermissionDecision =
+  | { outcome: "cancelled" }
+  | { outcome: "selected"; optionID: string; content?: HarnessElicitationContent };
+
+export interface HarnessCapabilityReceipt {
+  contractVersion: typeof HARNESS_CONTRACT_VERSION;
+  harness: string;
+  transport: HarnessTransportKind;
+  protocolVersion?: number;
+  agentName?: string;
+  agentVersion?: string;
+  observedAt: string;
+  source: "declared" | "negotiated" | "attested";
+  capabilities: {
+    sessionLoad: boolean;
+    sessionList: boolean;
+    sessionDelete: boolean;
+    sessionResume: boolean;
+    sessionFork: boolean;
+    sessionClose: boolean;
+    attachments: boolean;
+    modelDiscovery: boolean;
+    providerDiscovery: boolean;
+    planReporting: boolean;
+    usageReporting: boolean;
+    approvalBridge: boolean;
+  };
+}
 
 export interface HarnessCapabilities {
   contractVersion: typeof HARNESS_CONTRACT_VERSION;
+  transport: HarnessTransportCapabilities;
   sessionResume: boolean;
   sessionFork: boolean;
+  sessionLoad: boolean;
+  sessionList: boolean;
+  sessionDelete: boolean;
+  sessionClose: boolean;
+  sessionRewind: boolean;
   streamingOutput: boolean;
   cancellation: boolean;
+  nativeSteer: boolean;
+  nativeQueue: boolean;
+  approvalBridge: boolean;
+  planReporting: boolean;
+  nativeReview: boolean;
+  diffReporting: boolean;
+  checkpointing: boolean;
+  rollback: boolean;
+  subagents: boolean;
+  backgroundExecution: boolean;
+  usageReporting: boolean;
+  costReporting: boolean;
+  rateLimitReporting: boolean;
+  modelDiscovery: boolean;
+  providerDiscovery: boolean;
+  externalActions: boolean;
   attachments: boolean;
   modelSelection: boolean;
   effortSelection: boolean;
@@ -178,10 +419,36 @@ export function harnessCapabilities(
 ): HarnessCapabilities {
   return {
     contractVersion: HARNESS_CONTRACT_VERSION,
+    transport: {
+      kind: "plainText",
+      capabilityNegotiation: false,
+      structuredEvents: false,
+    },
     sessionResume: false,
     sessionFork: false,
+    sessionLoad: false,
+    sessionList: false,
+    sessionDelete: false,
+    sessionClose: false,
+    sessionRewind: false,
     streamingOutput: true,
     cancellation: true,
+    nativeSteer: false,
+    nativeQueue: false,
+    approvalBridge: false,
+    planReporting: false,
+    nativeReview: false,
+    diffReporting: false,
+    checkpointing: false,
+    rollback: false,
+    subagents: false,
+    backgroundExecution: false,
+    usageReporting: false,
+    costReporting: false,
+    rateLimitReporting: false,
+    modelDiscovery: false,
+    providerDiscovery: false,
+    externalActions: false,
     attachments: false,
     modelSelection: false,
     effortSelection: false,
@@ -199,6 +466,34 @@ export interface ProviderSessionContext {
   mode: "continue" | "fork";
   sourceRunId: string;
   providerSessionId?: string;
+}
+
+export type HarnessNativeReviewTarget =
+  | { type: "uncommittedChanges" }
+  | { type: "baseBranch"; branch: string }
+  | { type: "commit"; sha: string; title?: string }
+  | { type: "custom"; instructions: string };
+
+export interface HarnessNativeReviewRequest {
+  target: HarnessNativeReviewTarget;
+  /** Detached reviews keep the builder thread immutable. */
+  delivery?: "inline" | "detached";
+}
+
+/** Controls that are valid only while one provider-native turn is active. */
+export interface HarnessRuntimeControl {
+  harness: string;
+  providerSessionID: string;
+  providerTurnID: string;
+  steer?: (text: string) => Promise<{ providerTurnID: string }>;
+}
+
+/** Exact provider event material routed only to a relay-local private archive. */
+export interface HarnessRawEvent {
+  observedAt: string;
+  direction: "providerToCoode" | "coodeToProvider";
+  channel: "protocol" | "stdout" | "stderr";
+  payload: unknown;
 }
 
 /** Identifies which provider message a response delta belongs to. */
@@ -226,10 +521,24 @@ export interface ExecuteOptions {
   onTextDelta?: (data: string, message?: HarnessTextDeltaMessage) => void;
   /** Structured, provider-authored work activity for live UI and transcript summaries. */
   onActivity?: (activity: HarnessActivityUpdate) => void;
+  /** Native permission request. Callers must answer explicitly; absence fails closed. */
+  onPermissionRequest?: (
+    request: HarnessPermissionRequest,
+  ) => HarnessPermissionDecision | Promise<HarnessPermissionDecision>;
+  /** Exact-version capability evidence negotiated by a native protocol. */
+  onCapabilityReceipt?: (receipt: HarnessCapabilityReceipt) => void;
+  /** Publishes or clears controls whose lifetime is the active native turn. */
+  onRuntimeControl?: (control: HarnessRuntimeControl | undefined) => void;
+  /** Lossless local evidence. Callers must never copy this payload into Room history. */
+  onRawEvent?: (event: HarnessRawEvent) => void | Promise<void>;
   signal?: AbortSignal;
   model?: string;
   effort?: string;
   speed?: "standard" | "fast";
+  /** Grok headless native candidate fan-out. Values above one require an explicit non-ask permission mode. */
+  bestOfN?: number;
+  /** Grok headless self-verification loop. */
+  selfCheck?: boolean;
   permissionMode?: "ask" | "approve" | "fullAccess" | "plan" | "custom";
   activeGoal?: string;
   /** Room context — enables hooks that report activity to the room */
@@ -239,22 +548,67 @@ export interface ExecuteOptions {
   sessionToken?: string;
   attachments?: TuiAttachmentTransport[];
   providerSession?: ProviderSessionContext;
+  /** Ask the provider's native review engine to inspect this exact target. */
+  nativeReview?: HarnessNativeReviewRequest;
   browserAccess?: HarnessBrowserAccess;
   /** Short-lived Room automation and task-management authority for this turn. */
   workspaceAccess?: HarnessWorkspaceAccess;
+  delegation?: HarnessDelegationBridge;
   /** Fresh host-verified proof that a provider-native browser matches co·ode's safety contract. */
   browserProviderParity?: ProviderBrowserParity;
 }
 
 export type HarnessActivityKind =
+  | "artifact"
   | "browser"
   | "command"
   | "file"
+  | "image"
   | "plan"
   | "read"
   | "search"
   | "tests"
   | "tool";
+
+export type HarnessArtifactKind =
+  | "mcpApp"
+  | "html"
+  | "image"
+  | "audio"
+  | "video"
+  | "pdf"
+  | "text"
+  | "data"
+  | "file"
+  | "link"
+  | "unknown";
+
+/**
+ * A bounded, transport-neutral artifact emitted by a native harness.
+ *
+ * Artifact bytes stay process-local until the Relay converts them into normal
+ * Room attachment receipts. Provider-owned payloads are never copied directly
+ * into shared event metadata.
+ */
+export interface HarnessArtifactUpdate {
+  id: string;
+  kind: HarnessArtifactKind;
+  title: string;
+  mediaType: string;
+  fileName: string;
+  /** Original resource URI, retained only as inert presentation metadata. */
+  uri?: string;
+  /** UTF-8 text or base64 bytes, bounded again by the Relay before upload. */
+  content?: string;
+  encoding?: "utf8" | "base64";
+  /** MCP tool-result context needed to initialise an MCP App host bridge. */
+  context?: string;
+  displayMode?: "inline" | "fullscreen";
+  interactive?: boolean;
+  provider?: string;
+  server?: string;
+  tool?: string;
+}
 
 export interface HarnessActivityUpdate {
   kind: HarnessActivityKind;
@@ -272,6 +626,20 @@ export interface HarnessActivityUpdate {
   durationMs?: number;
   /** Optional syntax label for expandable activity details. */
   codeLanguage?: "json" | "shell" | "text";
+  /** Local images the harness explicitly inspected during this activity. */
+  imagePaths?: string[];
+  /** Provider-neutral artifacts rendered by the co·ode host. */
+  artifacts?: HarnessArtifactUpdate[];
+  /** Provider-native agent lineage, when the harness exposes it. */
+  agentID?: string;
+  parentAgentID?: string;
+  background?: boolean;
+  /** Stable, human-readable identity and owned task for delegated work. */
+  agentName?: string;
+  agentTask?: string;
+  /** Honest lifecycle/current-action signals; no synthetic percentage. */
+  agentStatus?: "working" | "completed" | "failed";
+  agentProgress?: string;
 }
 
 const sensitiveActivityPayloadKey = /(?:api[_-]?key|authorization|cookie|credential|password|secret|token)/i;
@@ -400,6 +768,58 @@ export interface ExecuteResult {
   stdout: string;
   stderr: string;
   providerSessionId?: string;
+  capabilityReceipt?: HarnessCapabilityReceipt;
+}
+
+/**
+ * Snapshot the adapter's exact v1 declaration when its transport cannot
+ * negotiate capabilities at runtime. The `source` field keeps this weaker
+ * evidence distinct from an ACP handshake while still making every run
+ * auditable and versioned.
+ */
+export function declaredHarnessCapabilityReceipt(
+  harness: string,
+  capabilities: HarnessCapabilities,
+  observedAt = new Date().toISOString(),
+): HarnessCapabilityReceipt {
+  return {
+    contractVersion: HARNESS_CONTRACT_VERSION,
+    harness,
+    transport: capabilities.transport.kind,
+    ...(capabilities.transport.protocolVersion !== undefined
+      ? { protocolVersion: capabilities.transport.protocolVersion }
+      : {}),
+    agentName: harness,
+    observedAt,
+    source: "declared",
+    capabilities: {
+      sessionLoad: capabilities.sessionLoad,
+      sessionList: capabilities.sessionList,
+      sessionDelete: capabilities.sessionDelete,
+      sessionResume: capabilities.sessionResume,
+      sessionFork: capabilities.sessionFork,
+      sessionClose: capabilities.sessionClose,
+      attachments: capabilities.attachments,
+      modelDiscovery: capabilities.modelDiscovery,
+      providerDiscovery: capabilities.providerDiscovery,
+      planReporting: capabilities.planReporting,
+      usageReporting: capabilities.usageReporting,
+      approvalBridge: capabilities.approvalBridge,
+    },
+  };
+}
+
+/** Attach and publish a declared receipt without replacing negotiated proof. */
+export function withDeclaredHarnessCapabilityReceipt(
+  result: ExecuteResult,
+  harness: string,
+  capabilities: HarnessCapabilities,
+  options: Pick<ExecuteOptions, "onCapabilityReceipt">,
+): ExecuteResult {
+  if (result.capabilityReceipt) return result;
+  const capabilityReceipt = declaredHarnessCapabilityReceipt(harness, capabilities);
+  options.onCapabilityReceipt?.(capabilityReceipt);
+  return { ...result, capabilityReceipt };
 }
 
 export function attachmentEnvironment(attachments?: TuiAttachmentTransport[]): Record<string, string> {

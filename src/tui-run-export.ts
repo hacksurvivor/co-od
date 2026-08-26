@@ -65,6 +65,14 @@ export function formatRunSummaryMarkdown(detail: RunDetailData, input: {
     lines.push(`- Handoff From: ${compact(run.handoff_from)}`);
     lines.push(`- Role: ${compact(run.subagent_role)}`);
   }
+  if (run.delegation_graph_id && run.delegation_operation_id) {
+    lines.push(`- Delegation Graph: ${run.delegation_graph_id}`);
+    lines.push(`- Operation: ${run.delegation_operation_id}`);
+    lines.push(`- Operation Role: ${compact(run.delegation_role)}`);
+    lines.push(`- Operation State: ${compact(run.delegation_state, compact(run.status, "unknown"))}`);
+    lines.push(`- Owner: ${compact(run.delegation_owning_person_id)}`);
+    lines.push(`- Revision: ${run.delegation_runtime_revision ?? 0}`);
+  }
   lines.push("");
   lines.push("## Goal");
   lines.push("");

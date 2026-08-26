@@ -21,14 +21,15 @@ function log(msg: string) {
 }
 
 function detectProvider(): string {
-  // Check what's available, prefer claude > codex > opencode > hermes > openclaw
+  // Check what's available, prefer established configured harnesses first.
   const checks = [
     { name: "claude", bin: "claude" },
     { name: "codex", bin: "codex" },
     { name: "opencode", bin: "opencode" },
     { name: "hermes", bin: "hermes" },
-    { name: "openclaw", bin: "zeroclaw" },
+    { name: "pi", bin: "pi" },
     { name: "openclaw", bin: "openclaw" },
+    { name: "zeroclaw", bin: "zeroclaw" },
   ];
 
   const paths = (process.env.PATH || "").split(":");

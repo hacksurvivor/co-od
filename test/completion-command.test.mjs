@@ -24,7 +24,7 @@ test("bash completion includes command aliases, commands, and key TUI flags", ()
   assert.match(script, /--renderer/);
   assert.match(script, /--provider/);
   assert.match(script, /--bridge-url/);
-  assert.match(script, /antigravity claude codex custom gemini grok hermes opencode openclaw zeroclaw/);
+  assert.match(script, /antigravity claude codex custom gemini grok hermes opencode openclaw pi zeroclaw/);
 });
 
 test("zsh completion includes command descriptions and command-specific flags", () => {

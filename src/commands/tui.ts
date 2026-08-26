@@ -1,4 +1,5 @@
 import { createInterface, emitKeypressEvents } from "node:readline";
+import { randomUUID } from "node:crypto";
 import * as api from "../api-client.js";
 import type { ProviderSessionContext } from "../adapters/base.js";
 import { type RoomTerminalSession } from "../connect.js";
@@ -1976,7 +1977,11 @@ class CoOdTerminalApp {
     this.render();
 
     try {
-      for (const target of targets) {
+      const graphId = randomUUID();
+      const rootHumanOperationId = randomUUID();
+      const sourceTaskId = randomUUID();
+      const leadOperationId = randomUUID();
+      for (const [index, target] of targets.entries()) {
         this.addFeed("info", `Fan-out target ${target.name} (${target.provider})`);
         const approvalStream = this.startBridgeApprovalStream(target.agentId);
         const result = await runTuiTask({
@@ -1987,6 +1992,23 @@ class CoOdTerminalApp {
           dir: this.args.dir,
           agentId: target.agentId,
           attachments: submitted.attachments,
+          delegation: {
+            graphId,
+            operationId: index === 0 ? leadOperationId : randomUUID(),
+            ...(index === 0 ? {} : { parentOperationId: leadOperationId }),
+            rootHumanOperationId,
+            sourceTaskId,
+            role: index === 0 ? "lead" : index === 1 ? "research" : "review",
+            owningPersonId: "self",
+            sponsoringPersonId: "self",
+            runtimeRevision: 0,
+            state: index === 0 ? "awaitingApproval" : "proposed",
+            riskReasons: index === 0 ? ["writer"] : [],
+            dependencyOperationIds: [],
+            workspaceId: this.args.dir,
+            ...(index === 0 ? { approvalId: randomUUID() } : {}),
+            visibility: "room",
+          },
           onEvent: (event) => this.handleTaskEvent(event),
         });
         approvalStream?.abort();
@@ -3082,6 +3104,7 @@ class CoOdTerminalApp {
         targetProvider: result.targetProvider,
         context: result.context,
         goal: result.goal,
+        delegation: result.delegation,
         model: result.targetProvider === this.provider ? this.model : undefined,
         dir: this.args.dir,
         onStatus: (message) => {

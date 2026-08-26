@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { createInterface } from "node:readline";
+import { spawn } from "node:child_process";
+import { executeAcpAgent } from "./acp.js";
 import {
   existingAttachmentPaths,
   coodeIsolatedBrowser,
@@ -19,7 +19,7 @@ function which(command: string): boolean {
 
 export function buildGrokArgs(
   goal: string,
-  options: Pick<ExecuteOptions, "attachments" | "effort" | "model" | "permissionMode" | "providerSession"> = {},
+  options: Pick<ExecuteOptions, "attachments" | "bestOfN" | "effort" | "model" | "permissionMode" | "providerSession" | "selfCheck"> = {},
 ): string[] {
   const references = existingAttachmentPaths(options.attachments);
   const prompt = references.length > 0
@@ -45,12 +45,101 @@ export function buildGrokArgs(
   ];
   if (options.model) args.push("--model", options.model);
   if (options.effort) args.push("--reasoning-effort", options.effort);
+  if (Number.isInteger(options.bestOfN) && Number(options.bestOfN) > 1) {
+    args.push("--best-of-n", String(Math.min(8, Number(options.bestOfN))));
+  }
+  if (options.selfCheck) args.push("--check");
   if (options.providerSession?.providerSessionId) {
     args.push("--resume", options.providerSession.providerSessionId);
     if (options.providerSession.mode === "fork") args.push("--fork-session");
   }
   return args;
 }
+
+const executeGrokHeadless = async (goal: string, options: ExecuteOptions): Promise<ExecuteResult> => {
+  if (["ask", "custom"].includes(options.permissionMode || "ask")) {
+    return {
+      exitCode: 78,
+      stdout: "",
+      stderr: "Grok best-of-N and check run headlessly. Choose Plan, Approve safe edits, or Full access explicitly before using them.",
+    };
+  }
+  return await new Promise<ExecuteResult>((resolve) => {
+    const args = buildGrokArgs(goal, options);
+    void options.onRawEvent?.({
+      observedAt: new Date().toISOString(),
+      direction: "coodeToProvider",
+      channel: "protocol",
+      payload: { command: "grok", args },
+    });
+    const child = spawn("grok", args, {
+      cwd: options.workDir,
+      env: providerProcessEnvironment({ ...options, provider: "grok" }),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let buffer = "";
+    let streamed = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      buffer += chunk;
+      while (buffer.includes("\n")) {
+        const index = buffer.indexOf("\n");
+        const line = buffer.slice(0, index).replace(/\r$/, "");
+        buffer = buffer.slice(index + 1);
+        if (!line.trim()) continue;
+        try {
+          const payload = JSON.parse(line) as Record<string, unknown>;
+          void options.onRawEvent?.({
+            observedAt: new Date().toISOString(),
+            direction: "providerToCoode",
+            channel: "protocol",
+            payload,
+          });
+          const delta = grokTextDelta(payload);
+          if (delta) {
+            streamed += delta;
+            options.onTextDelta?.(delta, { phase: "assistant" });
+            options.onOutput?.(delta);
+          }
+        } catch {
+          void options.onRawEvent?.({
+            observedAt: new Date().toISOString(),
+            direction: "providerToCoode",
+            channel: "stdout",
+            payload: `${line}\n`,
+          });
+        }
+      }
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+      void options.onRawEvent?.({
+        observedAt: new Date().toISOString(),
+        direction: "providerToCoode",
+        channel: "stderr",
+        payload: chunk,
+      });
+      options.onOutput?.(chunk);
+    });
+    child.once("error", (error) => resolve({ exitCode: 127, stdout: streamed, stderr: stderr || error.message }));
+    child.once("close", (code) => {
+      const parsed = parseGrokPrintOutput(stdout);
+      if (!streamed && parsed.text) options.onTextDelta?.(parsed.text, { phase: "assistant" });
+      resolve({
+        exitCode: code ?? 1,
+        stdout: parsed.text,
+        stderr,
+        providerSessionId: parsed.providerSessionId
+          || resolveProviderSessionIdFromResult(`${stdout}\n${stderr}`, options.providerSession),
+      });
+    });
+    options.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
+  });
+};
 
 export function grokTextDelta(payload: Record<string, unknown>): string | undefined {
   const type = String(payload.type || "").toLowerCase();
@@ -100,12 +189,31 @@ export function parseGrokPrintOutput(stdout: string): { text: string; providerSe
 export class GrokAdapter implements AgentAdapter {
   name = "grok";
   capabilities = harnessCapabilities({
+    transport: {
+      kind: "acp",
+      protocolVersion: 1,
+      capabilityNegotiation: true,
+      structuredEvents: true,
+    },
     sessionResume: true,
     sessionFork: true,
     attachments: true,
     modelSelection: true,
     effortSelection: true,
     permissionSelection: true,
+    sessionLoad: true,
+    sessionList: true,
+    sessionDelete: true,
+    approvalBridge: true,
+    planReporting: true,
+    nativeReview: true,
+    diffReporting: true,
+    subagents: true,
+    backgroundExecution: true,
+    usageReporting: true,
+    costReporting: true,
+    modelDiscovery: true,
+    providerDiscovery: true,
     browser: coodeIsolatedBrowser(),
   });
 
@@ -114,51 +222,16 @@ export class GrokAdapter implements AgentAdapter {
   }
 
   async execute(goal: string, options: ExecuteOptions): Promise<ExecuteResult> {
-    const args = buildGrokArgs(promptWithHarnessCapabilities(goal, options, this.name), options);
-    return new Promise<ExecuteResult>((resolve) => {
-      const child = spawn("grok", args, {
-        cwd: options.workDir,
-        env: providerProcessEnvironment({ ...options, provider: this.name }),
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let stdout = "";
-      let stderr = "";
-      let receivedTextDelta = false;
-      child.stdout?.setEncoding("utf8");
-      child.stderr?.setEncoding("utf8");
-      const lines = createInterface({ input: child.stdout!, crlfDelay: Infinity });
-      lines.on("line", (line) => {
-        stdout += `${line}\n`;
-        try {
-          const payload = JSON.parse(line) as Record<string, unknown>;
-          const delta = grokTextDelta(payload);
-          if (delta) {
-            receivedTextDelta = true;
-            options.onTextDelta?.(delta);
-            options.onOutput?.(delta);
-          }
-        } catch {
-          options.onOutput?.(`${line}\n`);
-        }
-      });
-      child.stderr?.on("data", (chunk: string) => {
-        stderr += chunk;
-      });
-      child.on("error", (error) => {
-        resolve({ exitCode: 127, stdout, stderr: stderr || error.message });
-      });
-      child.on("close", (code) => {
-        const parsed = parseGrokPrintOutput(stdout);
-        if (parsed.text && !receivedTextDelta) options.onTextDelta?.(parsed.text);
-        resolve({
-          exitCode: code ?? 1,
-          stdout: parsed.text,
-          stderr,
-          providerSessionId: parsed.providerSessionId
-            || resolveProviderSessionIdFromResult(`${stdout}\n${stderr}`, options.providerSession),
-        });
-      });
-      options.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
-    });
+    if ((options.bestOfN || 1) > 1 || options.selfCheck === true) {
+      return executeGrokHeadless(
+        promptWithHarnessCapabilities(goal, options, this.name),
+        options,
+      );
+    }
+    return executeAcpAgent(
+      { executable: "grok", args: ["agent", "stdio"], harness: this.name },
+      promptWithHarnessCapabilities(goal, options, this.name),
+      options,
+    );
   }
 }

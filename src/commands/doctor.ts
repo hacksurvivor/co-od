@@ -118,7 +118,9 @@ function providerCliChecks(options: DoctorOptions): DoctorCheck[] {
     { id: "provider-codex", label: "Provider codex", commands: ["codex"], install: "install Codex CLI" },
     { id: "provider-hermes", label: "Provider hermes", commands: ["hermes"], install: "install Hermes Agent" },
     { id: "provider-opencode", label: "Provider opencode", commands: [opencodeBin], install: "install OpenCode" },
-    { id: "provider-openclaw", label: "Provider openclaw", commands: ["zeroclaw", "openclaw"], install: "install ZeroClaw/OpenClaw" },
+    { id: "provider-openclaw", label: "Provider openclaw", commands: ["openclaw"], install: "install OpenClaw" },
+    { id: "provider-pi", label: "Provider pi", commands: ["pi"], install: "install @earendil-works/pi-coding-agent" },
+    { id: "provider-zeroclaw", label: "Provider zeroclaw", commands: ["zeroclaw"], install: "install ZeroClaw" },
   ];
 
   return providers.map((provider) => {
@@ -180,7 +182,7 @@ function installHintFor(kind: DoctorInstallKind): string {
   if (kind === "package") return `Package install: npm install -g ${PACKAGE_NAME}`;
   if (kind === "linked") return `Linked package: rebuild source package, then relink ${PACKAGE_NAME}`;
   if (kind === "unknown") return `Install package: npm install -g ${PACKAGE_NAME} or link this repo`;
-  return "From this repo: pnpm build && pnpm link --global";
+  return "From this repo: pnpm -C packages/cli build && pnpm -C packages/cli link --global";
 }
 
 function readFlagValue(args: string[], flag: string): string | undefined {
@@ -201,7 +203,7 @@ function updateHintFor(kind: DoctorInstallKind): string {
   if (kind === "package") return `Package update: npm update -g ${PACKAGE_NAME}`;
   if (kind === "linked") return "Linked update: pull source, pnpm install, rebuild, then relink";
   if (kind === "unknown") return `Update package: npm update -g ${PACKAGE_NAME} or pull and rebuild this repo`;
-  return "After pulling updates: pnpm install && pnpm build";
+  return "After pulling updates: pnpm install && pnpm -C packages/cli build";
 }
 
 export function strictDoctorFailures(report: Pick<DoctorReport, "checks">): DoctorCheck[] {

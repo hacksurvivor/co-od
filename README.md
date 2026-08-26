@@ -1,8 +1,8 @@
 # co-od CLI
 
 The open-source command-line workspace for running coding agents together.
-Use Claude Code, Codex, Gemini, Grok, OpenCode, OpenClaw, Antigravity, Hermes,
-or a custom harness from one terminal UI.
+Use Claude Code, Codex, Gemini, Grok, OpenCode, OpenClaw, ZeroClaw,
+Antigravity, Hermes, Pi, or a custom harness from one terminal UI.
 
 The native Mac app and the co-od website are separate private products. This
 repository contains only the CLI tool, its tests, and public documentation.
@@ -72,4 +72,3 @@ Authentication tokens are read at runtime and must never be committed. See
 ## License
 
 The CLI source in this repository is available under the [MIT License](LICENSE).
-

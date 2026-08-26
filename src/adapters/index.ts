@@ -8,6 +8,8 @@ import { GrokAdapter } from "./grok.js";
 import { HermesAdapter } from "./hermes.js";
 import { OpenClawAdapter } from "./openclaw.js";
 import { OpenCodeAdapter } from "./opencode.js";
+import { PiAdapter } from "./pi.js";
+import { ZeroClawAdapter } from "./zeroclaw.js";
 
 const adapters: Record<string, () => AgentAdapter> = {
   antigravity: () => new AntigravityAdapter(),
@@ -21,7 +23,8 @@ const adapters: Record<string, () => AgentAdapter> = {
   xai: () => new GrokAdapter(),
   opencode: () => new OpenCodeAdapter(),
   openclaw: () => new OpenClawAdapter(),
-  zeroclaw: () => new OpenClawAdapter(),
+  pi: () => new PiAdapter(),
+  zeroclaw: () => new ZeroClawAdapter(),
 };
 
 export function getAdapter(provider: string): AgentAdapter {
@@ -34,4 +37,4 @@ export function getHarnessCapabilities(provider: string): HarnessCapabilities {
   return getAdapter(provider).capabilities;
 }
 
-export const PROVIDER_LIST = "antigravity|claude|codex|custom|gemini|grok|hermes|opencode|openclaw|zeroclaw";
+export const PROVIDER_LIST = "antigravity|claude|codex|custom|gemini|grok|hermes|opencode|openclaw|pi|zeroclaw";

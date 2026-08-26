@@ -18,7 +18,7 @@ const NOW = 1760000000000;
 
 function baseState(overrides = {}) {
   const {
-    session = { sessionToken: "tok", user: { name: "Alex" } },
+    session = { sessionToken: "tok", user: { name: "sergey" } },
     config = { roomId: "room-1", roomName: "co-ode", provider: "opencode" },
     agents = [],
     runs = [],

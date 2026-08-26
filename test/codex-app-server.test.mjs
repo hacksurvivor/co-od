@@ -8,6 +8,8 @@ import {
   translateAppServerItem,
 } from "../dist/adapters/codex.js";
 import {
+  codexPermissionDecision,
+  codexPermissionRequest,
   codexPersistentThreadEnvironment,
   codexThreadConfig,
   CodexAppServerClient,
@@ -16,7 +18,324 @@ import {
   readCodexModels,
   readCodexUsageLimits,
   runCodexAppServerTurn,
+  validateMcpElicitationContent,
 } from "../dist/adapters/codex-app-server.js";
+
+test("Codex app-server approvals normalize into the shared fail-closed contract", () => {
+  const request = codexPermissionRequest("item/commandExecution/requestApproval", {
+    threadId: "thread-approval",
+    turnId: "turn-approval",
+    itemId: "item-approval",
+    command: "curl https://example.com",
+    cwd: "/workspace",
+    reason: "Needs network access",
+    availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+    additionalPermissions: {
+      network: { enabled: true },
+      token: "must-not-cross-the-activity-boundary",
+    },
+  });
+
+  assert.ok(request);
+  assert.equal(request.sessionID, "thread-approval");
+  assert.equal(request.toolCallID, "item-approval");
+  assert.equal(request.kind, "execute");
+  assert.deepEqual(request.options.map(({ id, kind }) => ({ id, kind })), [
+    { id: "accept", kind: "allow_once" },
+    { id: "acceptForSession", kind: "allow_always" },
+    { id: "decline", kind: "reject_once" },
+    { id: "cancel", kind: "reject_always" },
+  ]);
+  assert.match(request.input, /curl https:\/\/example\.com/);
+  assert.doesNotMatch(request.input, /must-not-cross-the-activity-boundary/);
+  assert.deepEqual(codexPermissionDecision(request, "ask"), {
+    outcome: "selected",
+    optionID: "decline",
+  });
+  assert.deepEqual(codexPermissionDecision(request, "custom"), {
+    outcome: "selected",
+    optionID: "decline",
+  });
+  assert.deepEqual(codexPermissionDecision(request, "plan"), {
+    outcome: "selected",
+    optionID: "cancel",
+  });
+  assert.deepEqual(codexPermissionDecision(request, "approve"), {
+    outcome: "selected",
+    optionID: "accept",
+  });
+  assert.deepEqual(codexPermissionDecision(request, "fullAccess"), {
+    outcome: "selected",
+    optionID: "acceptForSession",
+  });
+
+  const fileRequest = codexPermissionRequest("item/fileChange/requestApproval", {
+    threadId: "thread-approval",
+    itemId: "file-approval",
+    reason: "Apply the patch",
+    availableDecisions: ["accept", "decline"],
+  });
+  assert.equal(fileRequest?.kind, "edit");
+  assert.equal(fileRequest?.tool, "file_change");
+  assert.equal(codexPermissionRequest("item/tool/call", {}), undefined);
+
+  const permissionRequest = codexPermissionRequest("item/permissions/requestApproval", {
+    threadId: "thread-approval",
+    turnId: "turn-approval",
+    itemId: "network-approval",
+    cwd: "/workspace",
+    reason: "Reach the package registry",
+    permissions: { network: { enabled: true } },
+  });
+  assert.equal(permissionRequest?.scope, "externalAction");
+  assert.deepEqual(permissionRequest?.options.map(({ id, kind }) => ({ id, kind })), [
+    { id: "grantTurn", kind: "allow_once" },
+    { id: "deny", kind: "reject_once" },
+  ]);
+});
+
+test("Codex typed MCP elicitation preserves the provider schema and validates exact primitive content", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      email: { type: "string", format: "email", minLength: 3 },
+      retries: { type: "integer", minimum: 1, maximum: 5 },
+      alerts: { type: "boolean" },
+      regions: { type: "array", items: { type: "string", enum: ["eu", "us"] }, minItems: 1 },
+    },
+    required: ["email", "retries", "regions"],
+  };
+  const request = codexPermissionRequest("mcpServer/elicitation/request", {
+    threadId: "thread-form",
+    turnId: "turn-form",
+    serverName: "billing",
+    mode: "form",
+    message: "Connect billing",
+    requestedSchema: schema,
+  });
+  assert.deepEqual(request.requestedSchema, schema);
+  assert.equal(request.scope, "externalAction");
+  assert.deepEqual(request.options.map(({ id }) => id), ["accept", "decline", "cancel"]);
+  assert.deepEqual(validateMcpElicitationContent(schema, {
+    email: "owner@example.com",
+    retries: 2,
+    alerts: true,
+    regions: ["eu"],
+  }), {
+    email: "owner@example.com",
+    retries: 2,
+    alerts: true,
+    regions: ["eu"],
+  });
+  assert.equal(validateMcpElicitationContent(schema, {
+    email: "owner@example.com",
+    retries: 2.5,
+    regions: ["moon"],
+  }), undefined);
+  assert.equal(validateMcpElicitationContent(schema, {
+    email: "owner@example.com",
+    retries: 2,
+    regions: ["eu"],
+    secretExtra: "blocked",
+  }), undefined);
+});
+
+test("Codex App Server steers the exact active turn", async () => {
+  let notification;
+  let runtimeControl;
+  const requests = [];
+  const client = {
+    async ensureStarted() {},
+    isThreadActive() { return false; },
+    markThreadActive() {},
+    onNotification(handler) {
+      notification = handler;
+      return () => {};
+    },
+    onRequest() { return () => {}; },
+    async request(method, params) {
+      requests.push([method, params]);
+      if (method === "thread/start") return { thread: { id: "thread-steer" } };
+      if (method === "turn/start") return { turn: { id: "turn-steer" } };
+      if (method === "turn/steer") {
+        setTimeout(() => {
+          notification("item/completed", {
+            threadId: "thread-steer",
+            turnId: "turn-steer",
+            item: { type: "agentMessage", id: "answer", text: "Steered.", phase: "final_answer" },
+          });
+          notification("turn/completed", {
+            threadId: "thread-steer",
+            turn: { id: "turn-steer", status: "completed" },
+          });
+        }, 0);
+        return { turnId: "turn-steer" };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+  const resultPromise = runCodexAppServerTurn("Start", {
+    workDir: "/workspace",
+    client,
+    turnTimeoutMs: 2_000,
+    onRuntimeControl(control) {
+      if (!control) return;
+      runtimeControl = control;
+      void control.steer("Use the focused test instead");
+    },
+  });
+  const result = await resultPromise;
+  assert.equal(result.finalMessage, "Steered.");
+  assert.equal(runtimeControl.providerTurnID, "turn-steer");
+  assert.deepEqual(requests.find(([method]) => method === "turn/steer")?.[1], {
+    threadId: "thread-steer",
+    expectedTurnId: "turn-steer",
+    input: [{ type: "text", text: "Use the focused test instead" }],
+  });
+});
+
+test("Codex App Server forwards child-thread tools with durable parent lineage", async () => {
+  let notification;
+  const observed = [];
+  const client = {
+    async ensureStarted() {},
+    isThreadActive() { return false; },
+    markThreadActive() {},
+    onNotification(handler) {
+      notification = handler;
+      return () => {};
+    },
+    onRequest() { return () => {}; },
+    async request(method) {
+      if (method === "thread/start") return { thread: { id: "thread-root" } };
+      if (method === "turn/start") {
+        setTimeout(() => {
+          notification("item/completed", {
+            threadId: "thread-root",
+            item: {
+              type: "subAgentActivity",
+              id: "spawn-child",
+              kind: "started",
+              agentThreadId: "thread-child",
+              agentPath: "/root/ui_scout",
+            },
+          });
+          notification("item/started", {
+            threadId: "thread-child",
+            item: {
+              type: "commandExecution",
+              id: "child-command",
+              command: "rg -n sidebar apps/macos",
+            },
+          });
+          notification("item/completed", {
+            threadId: "thread-child",
+            item: {
+              type: "commandExecution",
+              id: "child-command",
+              command: "rg -n sidebar apps/macos",
+              exitCode: 0,
+            },
+          });
+          notification("item/completed", {
+            threadId: "thread-root",
+            item: { type: "agentMessage", id: "answer", text: "Done.", phase: "final_answer" },
+          });
+          notification("turn/completed", {
+            threadId: "thread-root",
+            turn: { id: "turn-root", status: "completed" },
+          });
+        }, 0);
+        return { turn: { id: "turn-root" } };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+
+  await runCodexAppServerTurn("Fix the UI", {
+    workDir: "/workspace",
+    client,
+    turnTimeoutMs: 2_000,
+    onItem(item, phase, context) {
+      observed.push({ type: item.type, phase, context });
+    },
+  });
+
+  assert.deepEqual(
+    observed.filter(({ type }) => type === "commandExecution").map(({ phase, context }) => ({
+      phase,
+      context,
+    })),
+    [
+      {
+        phase: "started",
+        context: {
+          threadId: "thread-child",
+          parentThreadId: "thread-root",
+          isSubagent: true,
+        },
+      },
+      {
+        phase: "completed",
+        context: {
+          threadId: "thread-child",
+          parentThreadId: "thread-root",
+          isSubagent: true,
+        },
+      },
+    ],
+  );
+});
+
+test("Codex App Server runs detached native review and returns review findings", async () => {
+  let notification;
+  const requests = [];
+  const client = {
+    async ensureStarted() {},
+    isThreadActive() { return false; },
+    markThreadActive() {},
+    onNotification(handler) {
+      notification = handler;
+      return () => {};
+    },
+    onRequest() { return () => {}; },
+    async request(method, params) {
+      requests.push([method, params]);
+      if (method === "thread/start") return { thread: { id: "thread-builder" } };
+      if (method === "review/start") {
+        setTimeout(() => {
+          notification("item/completed", {
+            threadId: "thread-review",
+            turnId: "turn-review",
+            item: { type: "exitedReviewMode", id: "review", review: "No findings." },
+          });
+          notification("turn/completed", {
+            threadId: "thread-review",
+            turn: { id: "turn-review", status: "completed" },
+          });
+        }, 0);
+        return { reviewThreadId: "thread-review", turn: { id: "turn-review" } };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+  const result = await runCodexAppServerTurn("unused", {
+    workDir: "/workspace",
+    client,
+    turnTimeoutMs: 2_000,
+    nativeReview: {
+      target: { type: "custom", instructions: "Review the completed change" },
+      delivery: "detached",
+    },
+  });
+  assert.equal(result.threadId, "thread-review");
+  assert.equal(result.finalMessage, "No findings.");
+  assert.deepEqual(requests.find(([method]) => method === "review/start")?.[1], {
+    threadId: "thread-builder",
+    target: { type: "custom", instructions: "Review the completed change" },
+    delivery: "detached",
+  });
+});
 
 test("Codex app-server initialization completes the required client handshake", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "coode-codex-app-server-"));
@@ -58,9 +377,131 @@ input.on("line", (line) => {
     .split("\n")
     .map((line) => JSON.parse(line));
   assert.equal(messages[0].method, "initialize");
+  assert.deepEqual(
+    messages[0].params.capabilities.extensions["io.modelcontextprotocol/ui"],
+    { mimeTypes: ["text/html;profile=mcp-app"] },
+  );
   assert.deepEqual(messages[1], {
     jsonrpc: "2.0",
     method: "initialized",
+  });
+});
+
+test("Codex app-server exits during handshake without leaking an uncaught EPIPE", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "coode-codex-app-server-exit-"));
+  const executable = join(directory, "codex");
+  await writeFile(executable, `#!/bin/sh
+exit 0
+`, "utf8");
+  await chmod(executable, 0o755);
+
+  const client = new CodexAppServerClient({
+    environment: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH || ""}`,
+    },
+  });
+  t.after(() => client.dispose());
+
+  await assert.rejects(
+    client.ensureStarted(),
+    /codex app-server (?:exited|write failed|initialize request write failed)/,
+  );
+  await assert.rejects(
+    client.request("thread/start", {}),
+    /codex app-server is not running/,
+  );
+});
+
+test("Codex app-server sends the UI-selected native approval response", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "coode-codex-approval-"));
+  const executable = join(directory, "codex");
+  const transcript = join(directory, "transcript.jsonl");
+  await writeFile(executable, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const transcript = process.env.COODE_APP_SERVER_TRANSCRIPT;
+const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+input.on("line", (line) => {
+  appendFileSync(transcript, line + "\\n");
+  const message = JSON.parse(line);
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: {} });
+  } else if (message.method === "thread/start") {
+    send({ jsonrpc: "2.0", id: message.id, result: { thread: { id: "thread-approval" } } });
+  } else if (message.method === "turn/start") {
+    send({ jsonrpc: "2.0", id: message.id, result: { turn: { id: "turn-approval" } } });
+    setTimeout(() => send({
+      jsonrpc: "2.0",
+      id: 701,
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: "thread-approval",
+        turnId: "turn-approval",
+        itemId: "command-approval",
+        command: "npm test",
+        cwd: "/workspace",
+        reason: "Run the verification suite",
+        availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+      },
+    }), 5);
+  } else if (message.id === 701 && message.result?.decision === "accept") {
+    send({
+      jsonrpc: "2.0",
+      method: "item/completed",
+      params: {
+        threadId: "thread-approval",
+        turnId: "turn-approval",
+        item: { type: "agentMessage", id: "answer", text: "Approved safely.", phase: "final_answer" },
+      },
+    });
+    send({
+      jsonrpc: "2.0",
+      method: "turn/completed",
+      params: { threadId: "thread-approval", turn: { id: "turn-approval", status: "completed" } },
+    });
+  }
+});
+`, "utf8");
+  await chmod(executable, 0o755);
+
+  const client = new CodexAppServerClient({
+    environment: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH || ""}`,
+      COODE_APP_SERVER_TRANSCRIPT: transcript,
+    },
+  });
+  t.after(() => client.dispose());
+  const approvals = [];
+  const result = await runCodexAppServerTurn("Run the tests", {
+    workDir: directory,
+    client,
+    approvalPolicy: "on-request",
+    permissionMode: "ask",
+    turnTimeoutMs: 2_000,
+    onPermissionRequest: (request) => {
+      approvals.push(request);
+      return { outcome: "selected", optionID: "accept" };
+    },
+  });
+
+  assert.equal(result.finalMessage, "Approved safely.");
+  assert.equal(approvals.length, 1);
+  assert.equal(approvals[0].toolCallID, "command-approval");
+  const messages = (await readFile(transcript, "utf8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(
+    messages.find((message) => message.method === "turn/start")?.params?.approvalPolicy,
+    "on-request",
+  );
+  assert.deepEqual(messages.find((message) => message.id === 701 && message.result), {
+    jsonrpc: "2.0",
+    id: 701,
+    result: { decision: "accept" },
   });
 });
 
@@ -456,6 +897,7 @@ test("translateAppServerItem maps app-server items to exec event shapes", () => 
       type: "item.completed",
       item: {
         type: "mcp_tool_call",
+        id: "i-tool",
         server: "pathmark",
         tool: "recall_memory",
         arguments: { query: "prior decisions" },
@@ -467,6 +909,62 @@ test("translateAppServerItem maps app-server items to exec event shapes", () => 
         error: null,
         status: "completed",
         duration_ms: 4_200,
+        appContext: undefined,
+        mcpAppResourceUri: undefined,
+        pluginId: undefined,
+        artifact_deferred: true,
+      },
+    },
+  );
+  assert.deepEqual(
+    translateAppServerItem({
+      type: "collabAgentToolCall",
+      id: "collab-1",
+      tool: "spawnAgent",
+      status: "completed",
+      senderThreadId: "agent-root",
+      receiverThreadIds: ["agent-child"],
+      prompt: "Audit multiplayer presence",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "high",
+      agentsStates: {
+        "agent-child": { status: "running", message: null },
+      },
+    }),
+    {
+      type: "item.completed",
+      item: {
+        type: "collab_agent_tool_call",
+        id: "collab-1",
+        tool: "spawnAgent",
+        prompt: "Audit multiplayer presence",
+        status: "completed",
+        sender_thread_id: "agent-root",
+        receiver_thread_ids: ["agent-child"],
+        model: "gpt-5.6-sol",
+        reasoning_effort: "high",
+        agents_states: {
+          "agent-child": { status: "running", message: null },
+        },
+      },
+    },
+  );
+  assert.deepEqual(
+    translateAppServerItem({
+      type: "subAgentActivity",
+      id: "call-subagent",
+      kind: "started",
+      agentThreadId: "agent-repo-scout",
+      agentPath: "/root/repo_scout",
+    }),
+    {
+      type: "item.completed",
+      item: {
+        type: "subagent_activity",
+        id: "call-subagent",
+        kind: "started",
+        agent_thread_id: "agent-repo-scout",
+        agent_path: "/root/repo_scout",
       },
     },
   );

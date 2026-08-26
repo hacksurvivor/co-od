@@ -63,6 +63,25 @@ export interface RoomTaskResult {
   stderr: string;
 }
 
+export interface RoomTaskDelegationInput {
+  graphId: string;
+  operationId: string;
+  parentOperationId?: string;
+  rootHumanOperationId: string;
+  sourceTaskId: string;
+  role: "lead" | "research" | "review" | "write" | "arbitrate";
+  owningPersonId: string;
+  sponsoringPersonId: string;
+  runtimeRevision: number;
+  state: "proposed" | "awaitingApproval" | "queued" | "running" | "reported" | "joined" | "denied" | "cancelling" | "cancelled" | "failed" | "stale";
+  riskReasons: string[];
+  dependencyOperationIds: string[];
+  workspaceId?: string;
+  writerLeaseId?: string;
+  approvalId?: string;
+  visibility?: "private" | "owner" | "room";
+}
+
 export interface ExecuteRoomTaskOptions {
   roomId: string;
   goal: string;
@@ -73,6 +92,7 @@ export interface ExecuteRoomTaskOptions {
   attachments?: TuiAttachmentTransport[];
   continueRunId?: string;
   providerSession?: ProviderSessionContext;
+  delegation?: RoomTaskDelegationInput;
   onOutput?: (data: string) => void;
   onStatus?: (message: string) => void;
 }
@@ -297,7 +317,12 @@ export async function executeRoomTask(options: ExecuteRoomTaskOptions): Promise<
 
   const createRes = await api.post<CreateRunResponse>(
     `/api/rooms/${options.roomId}/agent-runs`,
-    { goal: options.goal, agentId: agent._id, continueRunId: options.continueRunId }
+    {
+      goal: options.goal,
+      agentId: agent._id,
+      continueRunId: options.continueRunId,
+      delegation: options.delegation,
+    }
   );
 
   const runId = createRes.runId;
