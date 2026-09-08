@@ -10,9 +10,9 @@ and downloadable Mac release binaries.
 
 ## Native Mac app
 
-[Download co·od for Mac](https://github.com/hacksurvivor/co-od/releases/download/macos-0.3.1.0-20260908071837/co-od-0.3.1.0-20260908071837-macOS-26-arm64.dmg) · [Release notes](https://github.com/hacksurvivor/co-od/releases/tag/macos-0.3.1.0-20260908071837)
+[Download co·od for Mac](https://github.com/hacksurvivor/co-od/releases/download/macos-0.3.1.0-20260908125246/co-od-0.3.1.0-20260908125246-macOS-26-arm64.dmg) · [Release notes](https://github.com/hacksurvivor/co-od/releases/tag/macos-0.3.1.0-20260908125246)
 
-The current alpha is version **0.3.1.0**, build **20260908071837**, for Apple
+The current alpha is version **0.3.1.0**, build **20260908125246**, for Apple
 silicon Macs running macOS 26.5 or later. The installer is Developer ID signed,
 notarized, and stapled. The native app remains a separate product; its source
 is not included under this repository’s CLI license.
