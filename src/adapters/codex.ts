@@ -1,7 +1,8 @@
+import { registerArtifactRuntime } from "./artifact-runtime.js";
+import { managedIntegrationRuntime, ManagedIntegrationRuntimeError } from "./managed-integrations.js";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
-import { existsSync } from "node:fs";
 import {
   boundedActivityPayload,
   existingAttachmentPaths,
@@ -26,10 +27,12 @@ import {
 } from "./harness-artifacts.js";
 import {
   CodexAppServerTurnTerminatedError,
+  codexServiceTier,
   disposeCodexAppServer,
   getCodexAppServer,
   runCodexAppServerTurn,
 } from "./codex-app-server.js";
+import { resolveCodexExecutable } from "./codex-executable.js";
 
 const codexNativeControls: HarnessNativeControlService = {
   async snapshot(context) {
@@ -89,11 +92,6 @@ const codexNativeControls: HarnessNativeControlService = {
     return this.snapshot(context);
   },
 };
-
-function which(cmd: string): boolean {
-  const paths = (process.env.PATH || "").split(":");
-  return paths.some((dir) => existsSync(`${dir}/${cmd}`));
-}
 
 const compactText = (value: unknown, maximum = 512): string | undefined => {
   const text = Array.isArray(value)
@@ -183,8 +181,14 @@ function codexSingleActivityFromEvent(
       };
     }
     case "file_change": {
+      const changes = Array.isArray(item.changes) ? item.changes as Array<{ path?: string; diff?: string }> : [];
       const path = compactText(item.path)
-        || compactText((item.changes as Array<{ path?: string }> | undefined)?.[0]?.path);
+        || compactText(changes[0]?.path);
+      const patch = boundedOutput(changes.map(change => {
+        if (typeof change.diff !== "string" || !change.diff.trim()) return "";
+        const file = compactText(change.path, 2_048);
+        return file ? `File: ${file}\n${change.diff}` : change.diff;
+      }).filter(Boolean).join("\n\n") || item.diff);
       return {
         kind: "file",
         phase,
@@ -192,6 +196,7 @@ function codexSingleActivityFromEvent(
         detail: path,
         tool: "file_change",
         ...(path ? { input: path, codeLanguage: "text" as const } : {}),
+        ...(phase === "completed" && patch ? { output: patch } : {}),
       };
     }
     case "mcp_tool_call": {
@@ -636,6 +641,19 @@ export async function codexArtifactActivityFromItem(
       tool,
     }];
   }
+  if (typeof item.id === "string" && resourceURI) {
+    for (const artifact of artifacts) {
+      try {
+        artifact.runtimeBindingID = await registerArtifactRuntime(artifact, {
+          threadId, originCallId: item.id, server, tool, uri: resourceURI,
+          ...(typeof appContext?.connectorId === "string" ? { connectorId: appContext.connectorId } : {}),
+        });
+      } catch {
+        // Saving an origin binding cannot discard an otherwise usable preview.
+        // The host only advertises callbacks after the binding is revalidated.
+      }
+    }
+  }
   if (artifacts.length === 0) return undefined;
   return {
     kind: "artifact",
@@ -691,7 +709,8 @@ export function buildCodexArgs(
     );
   }
   if (options.effort) args.push("--config", `model_reasoning_effort=\"${options.effort}\"`);
-  if (options.speed === "fast") args.push("--config", `service_tier=\"fast\"`);
+  const serviceTier = codexServiceTier(options.speed);
+  if (serviceTier) args.push("--config", `service_tier=\"${serviceTier}\"`);
   if (permission || providerSessionId) args.push("exec");
   if (providerSessionId) args.push("resume");
   // Use the provider's ordinary configuration so installed plugins, skills,
@@ -826,7 +845,11 @@ export function translateAppServerItem(
   }
   if (type === "fileChange" || type === "fileUpdate") {
     const changes = (item.changes as Array<{ path?: string }> | undefined) || [];
-    return { type: eventType, item: { type: "file_change", path: item.path || changes[0]?.path } };
+    return { type: eventType, item: {
+      type: "file_change", path: item.path || changes[0]?.path,
+      ...(changes.length ? { changes } : {}),
+      ...(item.diff !== undefined ? { diff: item.diff } : {}),
+    } };
   }
   if (type === "reasoning") {
     const summary = (item.summary as string[] | undefined)?.join(" ") || "";
@@ -978,7 +1001,7 @@ export class CodexAdapter implements AgentAdapter {
   nativeControls = codexNativeControls;
 
   async available(): Promise<boolean> {
-    return which("codex");
+    return Boolean(resolveCodexExecutable());
   }
 
   dispose(): void {
@@ -1008,6 +1031,13 @@ export class CodexAdapter implements AgentAdapter {
     let lastReasoningTitle = "";
     let lastReasoningPublishedAt = 0;
     const completedMcpItems: Record<string, unknown>[] = [];
+    let presentationDelivery = Promise.resolve();
+    const emitActivity = (activity: HarnessActivityUpdate) => {
+      presentationDelivery = presentationDelivery.then(() => { options.onActivity?.(activity); });
+    };
+    const emitText: NonNullable<ExecuteOptions["onTextDelta"]> = (text, message) => {
+      presentationDelivery = presentationDelivery.then(() => { options.onTextDelta?.(text, message); });
+    };
     const collaborationLabels: CodexAgentLabels = new Map();
     const processEnvironment = providerProcessEnvironment({
       ...options,
@@ -1026,6 +1056,7 @@ export class CodexAdapter implements AgentAdapter {
       ? "never"
       : "on-request";
     const result = await runCodexAppServerTurn(goal, {
+        attachments: options.attachments,
         workDir: options.workDir,
         model: options.model,
         effort: options.effort,
@@ -1040,7 +1071,7 @@ export class CodexAdapter implements AgentAdapter {
         onRuntimeControl: options.onRuntimeControl,
         onRawEvent: options.onRawEvent,
         onPermissionRequest: async (request) => {
-          options.onActivity?.({
+          emitActivity({
             kind: request.kind === "execute" ? "command" : "file",
             phase: "started",
             title: `Approval required: ${request.title}`,
@@ -1054,7 +1085,7 @@ export class CodexAdapter implements AgentAdapter {
             const selected = decision.outcome === "selected"
               ? request.options.find((option) => option.id === decision.optionID)
               : undefined;
-            options.onActivity?.({
+            emitActivity({
               kind: request.kind === "execute" ? "command" : "file",
               phase: "completed",
               title: request.title,
@@ -1071,7 +1102,7 @@ export class CodexAdapter implements AgentAdapter {
               || request.options.find((option) => option.kind === "reject_once")
             : request.options.find((option) => option.kind === "reject_once")
               || request.options.find((option) => option.kind === "reject_always");
-          options.onActivity?.({
+          emitActivity({
             kind: request.kind === "execute" ? "command" : "file",
             phase: "completed",
             title: request.title,
@@ -1098,7 +1129,7 @@ export class CodexAdapter implements AgentAdapter {
           if (message.itemId) activeMessageItemId = message.itemId;
           if (separatedText) streamedDelta = true;
           if (text) {
-            options.onTextDelta?.(text, {
+            emitText(text, {
               messageID: message.itemId,
               phase: message.phase,
             });
@@ -1113,32 +1144,38 @@ export class CodexAdapter implements AgentAdapter {
           if (lastReasoningTitle && now - lastReasoningPublishedAt < 250) return;
           lastReasoningTitle = activity.title;
           lastReasoningPublishedAt = now;
-          options.onActivity?.(activity);
+          emitActivity(activity);
         },
         onItem: (item, phase, context) => {
-          if (phase === "completed"
-              && item.type === "mcpToolCall"
-              && !context?.isSubagent) {
-            completedMcpItems.push(item);
-          }
           if (context?.isSubagent
               && phase === "completed"
               && item.type === "agentMessage") {
             const progress = codexChildMessageActivity(item, context, collaborationLabels);
-            if (progress) options.onActivity?.(progress);
+            if (progress) emitActivity(progress);
           }
           // Translate app-server items into the exec JSONL event shape the
           // room reporting + display pipeline already understands.
           const translated = translateAppServerItem(item, phase);
           if (!translated) return;
           for (const activity of codexActivitiesFromEvent(translated, collaborationLabels)) {
-            options.onActivity?.(
+            emitActivity(
               context?.isSubagent
                 ? codexChildActivity(activity, context, collaborationLabels)
                 : activity,
             );
           }
           if (phase !== "completed") return;
+          if (item.type === "mcpToolCall" && !context?.isSubagent) {
+            if (context?.threadId) {
+              const threadId = context.threadId;
+              // Reserve this item's chronological place while its UI resource
+              // is hydrated; later narration cannot jump ahead of the result.
+              presentationDelivery = presentationDelivery.then(async () => {
+                const artifact = await codexArtifactActivityFromItem(item, threadId, appServer);
+                if (artifact) options.onActivity?.(artifact);
+              });
+            } else { completedMcpItems.push(item); }
+          }
           stdout += `${JSON.stringify(translated)}
 `;
           if (reportConfig) void reportCodexEvent(translated, reportConfig);
@@ -1156,7 +1193,7 @@ export class CodexAdapter implements AgentAdapter {
       collaborationLabels,
       result.exitCode !== 0,
     )) {
-      options.onActivity?.(activity);
+      emitActivity(activity);
     }
     for (const item of completedMcpItems) {
       const activity = await codexArtifactActivityFromItem(
@@ -1164,7 +1201,7 @@ export class CodexAdapter implements AgentAdapter {
         result.threadId,
         appServer,
       );
-      if (activity) options.onActivity?.(activity);
+      if (activity) emitActivity(activity);
     }
     // Synthesize thread.started so provider-session extraction keeps working.
     const threadEvent = { type: "thread.started", thread_id: result.threadId };
@@ -1172,10 +1209,11 @@ export class CodexAdapter implements AgentAdapter {
 ${stdout}`;
     if (reportConfig) void reportCodexEvent(threadEvent, reportConfig);
     if (result.finalMessage && !streamedDelta) {
-      options.onTextDelta?.(result.finalMessage);
+      emitText(result.finalMessage);
       options.onOutput?.(`${result.finalMessage}
 `);
     }
+    await presentationDelivery;
     return {
       exitCode: result.exitCode,
       stdout: codexDisplayStdout(
@@ -1233,6 +1271,9 @@ ${stdout}`;
       }
     }
 
+    if (managedIntegrationRuntime("codex")) {
+      throw new ManagedIntegrationRuntimeError("This co·od library requires Codex app-server skill loading. The agent was not started with an incomplete integration setup.");
+    }
     // Use --json for JSONL event streaming when we have room context.
     const args = buildCodexArgs(executionGoal, {
       attachments: options.attachments,
@@ -1247,7 +1288,7 @@ ${stdout}`;
 
     const collaborationLabels: CodexAgentLabels = new Map();
     const result = await new Promise<ExecuteResult>((resolve, reject) => {
-      const child = spawn("codex", args, {
+      const child = spawn(resolveCodexExecutable() || "codex", args, {
         cwd: workDir,
         env: providerProcessEnvironment({ ...options, provider: this.name }),
         stdio: ["pipe", "pipe", "pipe"],

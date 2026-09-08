@@ -10,10 +10,12 @@
 //
 // The exec path stays as fallback — if the daemon can't start or a turn
 // fails to dispatch, callers fall back to `codex exec`.
+import { managedIntegrationRuntime, codexManagedIntegrationConfig, type ManagedIntegrationRuntime } from "./managed-integrations.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
 import { createInterface } from "node:readline";
+import { resolveCodexExecutable } from "./codex-executable.js";
 import {
   codexWorkspaceDynamicTools,
   invokeWorkspaceTool,
@@ -21,6 +23,8 @@ import {
 } from "../workspace-tools.js";
 import {
   boundedActivityPayload,
+  existingAttachmentPaths,
+  providerProcessEnvironment,
   type ExecuteOptions,
   type HarnessNativeReviewRequest,
   type HarnessPermissionDecision,
@@ -44,8 +48,8 @@ const TURN_INTERRUPT_TIMEOUT_MS = 10_000;
 const MCP_STARTUP_TIMEOUT_MS = 15_000;
 const MCP_STARTUP_QUIET_MS = 750;
 
-/** A coding turn gets a generous hard deadline, but never runs forever. */
-export const DEFAULT_CODEX_TURN_TIMEOUT_MS = 30 * 60_000;
+/** Native turns run until completion or cancellation; callers may select a deadline. */
+export const DEFAULT_CODEX_TURN_TIMEOUT_MS = 0;
 
 export class CodexAppServerTurnTerminatedError extends Error {
   readonly dispatched = true;
@@ -65,6 +69,7 @@ export interface CodexAppServerClientOptions {
    * the user's normal plugins, skills, and MCP servers from CODEX_HOME.
    */
   environment?: NodeJS.ProcessEnv;
+  managedIntegrations?: ManagedIntegrationRuntime;
 }
 
 export class CodexAppServerClient {
@@ -75,6 +80,20 @@ export class CodexAppServerClient {
   private requestHandlers = new Set<ServerRequestHandler>();
   private activeThreads = new Map<string, string>();
   private starting?: Promise<void>;
+  private uses = 0;
+  private retired = false;
+  managedIntegrationConfig?: Record<string, unknown>;
+
+  beginUse(): void { this.uses += 1; }
+  endUse(): void {
+    this.uses = Math.max(0, this.uses - 1);
+    if (this.retired && this.uses === 0) { this.dispose(); retiring.delete(this); }
+  }
+  retire(): boolean {
+    this.retired = true;
+    if (this.uses === 0) { this.dispose(); return false; }
+    return true;
+  }
 
   constructor(private readonly options: CodexAppServerClientOptions = {}) {}
 
@@ -88,8 +107,12 @@ export class CodexAppServerClient {
     }
     const starting = this.start();
     this.starting = starting;
-    void starting.catch(() => {
-      if (this.starting === starting) this.starting = undefined;
+    void starting.catch((error) => {
+      if (this.starting === starting) {
+        const child = this.child;
+        if (child) { this.failChild(child, error instanceof Error ? error : new Error(String(error))); child.kill(); }
+        this.starting = undefined;
+      }
     });
     return starting;
   }
@@ -128,9 +151,10 @@ export class CodexAppServerClient {
   }
 
   private async start(): Promise<void> {
-    const child = spawn("codex", ["app-server"], {
+    const environment = this.options.environment ?? process.env;
+    const child = spawn(resolveCodexExecutable(environment) || "codex", ["app-server"], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: this.options.environment ?? process.env,
+      env: environment,
     });
     child.unref();
     this.child = child;
@@ -166,6 +190,11 @@ export class CodexAppServerClient {
       },
     });
     this.notify("initialized");
+    if (this.options.managedIntegrations) {
+      const config = await this.request("config/read", { includeLayers: false }) as { config?: Record<string, unknown> };
+      this.managedIntegrationConfig = codexManagedIntegrationConfig(this.options.managedIntegrations, config.config || {});
+      await this.request("skills/extraRoots/set", { extraRoots: this.options.managedIntegrations.skillRoots });
+    }
   }
 
   private handleLine(line: string): void {
@@ -322,28 +351,44 @@ export class CodexAppServerClient {
 }
 
 let shared: CodexAppServerClient | undefined;
+let sharedIntegrationSignature: string | undefined;
+const retiring = new Set<CodexAppServerClient>();
+let registeredExit = false;
 
-export function getCodexAppServer(
-  environment?: NodeJS.ProcessEnv,
-): CodexAppServerClient {
-  if (!shared) {
-    shared = new CodexAppServerClient(
-      environment ? { environment } : undefined,
-    );
-    // The daemon must never outlive the CLI.
-    process.once("exit", () => shared?.dispose());
+export function getCodexAppServer(environment?: NodeJS.ProcessEnv): CodexAppServerClient {
+  // Integration ownership is evaluated by co-od before its private control
+  // environment is scrubbed from the provider child.
+  const managedEnvironment = environment?.COODE_MANAGED_INTEGRATIONS_PATH ? environment : process.env;
+  const managedIntegrations = managedIntegrationRuntime("codex", managedEnvironment);
+  if (!shared || sharedIntegrationSignature !== managedIntegrations?.signature) {
+    if (shared?.retire()) retiring.add(shared);
+    shared = new CodexAppServerClient({ environment: providerProcessEnvironment({ provider: "codex" }, environment ?? process.env), managedIntegrations });
+    sharedIntegrationSignature = managedIntegrations?.signature;
+    if (!registeredExit) {
+      registeredExit = true;
+      process.once("exit", disposeCodexAppServer);
+    }
   }
   return shared;
 }
 
 export function disposeCodexAppServer(): void {
   shared?.dispose();
+  for (const client of retiring) client.dispose();
+  retiring.clear();
   shared = undefined;
+  sharedIntegrationSignature = undefined;
+}
+
+/** Omission inherits Codex settings; Standard must explicitly clear Fast. */
+export function codexServiceTier(speed: "standard" | "fast" | undefined): "default" | "fast" | undefined {
+  return speed === "standard" ? "default" : speed;
 }
 
 export interface AppServerTurnOptions {
   workDir: string;
   model?: string;
+  attachments?: ExecuteOptions["attachments"];
   effort?: string;
   speed?: "standard" | "fast";
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
@@ -383,7 +428,7 @@ export interface AppServerTurnOptions {
    * short-lived Room capabilities remain scoped to the Codex thread.
    */
   environmentOverrides?: NodeJS.ProcessEnv;
-  /** Override the generous default hard deadline for a coding turn. */
+  /** Optional caller-selected deadline; zero leaves the native turn unbounded. */
   turnTimeoutMs?: number;
   /** Cancels the provider turn rather than merely abandoning the local wait. */
   signal?: AbortSignal;
@@ -807,8 +852,8 @@ export async function prepareCodexAppServerThread(
       sandbox: options.sandbox ?? "workspace-write",
       approvalPolicy: options.approvalPolicy ?? "never",
       ...(options.model ? { model: options.model } : {}),
-      ...(options.speed === "fast" ? { serviceTier: "fast" } : {}),
-      ...(threadConfig ? { config: threadConfig } : {}),
+      ...(options.speed ? { serviceTier: codexServiceTier(options.speed) } : {}),
+      ...((threadConfig || server.managedIntegrationConfig) ? { config: { ...threadConfig, ...server.managedIntegrationConfig } } : {}),
       dynamicTools: codexWorkspaceDynamicTools(),
     }) as { thread?: { id?: string } };
     const preparedThreadId = started?.thread?.id;
@@ -837,6 +882,16 @@ export async function runCodexAppServerTurn(
   options: AppServerTurnOptions,
 ): Promise<AppServerTurnResult> {
   const server = options.client ?? getCodexAppServer();
+  server.beginUse?.();
+  try { return await runCodexAppServerTurnWithClient(goal, { ...options, client: server }); }
+  finally { server.endUse?.(); }
+}
+
+async function runCodexAppServerTurnWithClient(
+  goal: string,
+  options: AppServerTurnOptions,
+): Promise<AppServerTurnResult> {
+  const server = options.client ?? getCodexAppServer();
   await server.ensureStarted();
   const threadConfig = codexPersistentThreadConfig(options.environmentOverrides);
   const runtimeSignature = codexThreadRuntimeSignature(options);
@@ -848,7 +903,8 @@ export async function runCodexAppServerTurn(
       cwd: options.workDir,
       sandbox: options.sandbox ?? "workspace-write",
       approvalPolicy: options.approvalPolicy ?? "never",
-      ...(threadConfig ? { config: threadConfig } : {}),
+      ...(options.speed ? { serviceTier: codexServiceTier(options.speed) } : {}),
+      ...((threadConfig || server.managedIntegrationConfig) ? { config: { ...threadConfig, ...server.managedIntegrationConfig } } : {}),
     }) as { thread?: { id?: string } };
     threadId = forked?.thread?.id;
     if (!threadId) throw new Error("codex app-server did not return a forked thread id");
@@ -859,7 +915,8 @@ export async function runCodexAppServerTurn(
       cwd: options.workDir,
       sandbox: options.sandbox ?? "workspace-write",
       approvalPolicy: options.approvalPolicy ?? "never",
-      ...(threadConfig ? { config: threadConfig } : {}),
+      ...(options.speed ? { serviceTier: codexServiceTier(options.speed) } : {}),
+      ...((threadConfig || server.managedIntegrationConfig) ? { config: { ...threadConfig, ...server.managedIntegrationConfig } } : {}),
     })
       .catch(() => null) as { thread?: { id?: string } } | null;
     threadId = resumed?.thread?.id || threadId;
@@ -871,8 +928,8 @@ export async function runCodexAppServerTurn(
       sandbox: options.sandbox ?? "workspace-write",
       approvalPolicy: options.approvalPolicy ?? "never",
       ...(options.model ? { model: options.model } : {}),
-      ...(options.speed === "fast" ? { serviceTier: "fast" } : {}),
-      ...(threadConfig ? { config: threadConfig } : {}),
+      ...(options.speed ? { serviceTier: codexServiceTier(options.speed) } : {}),
+      ...((threadConfig || server.managedIntegrationConfig) ? { config: { ...threadConfig, ...server.managedIntegrationConfig } } : {}),
       dynamicTools: codexWorkspaceDynamicTools(),
     }) as { thread?: { id?: string } };
     threadId = started?.thread?.id;
@@ -966,10 +1023,15 @@ export async function runCodexAppServerTurn(
         const item = params.item as Record<string, unknown> | undefined;
         if (!item) return;
         const phase = method === "item/started" ? "started" : "completed";
-        if (isRootThread
-            && item.type === "subAgentActivity"
-            && typeof item.agentThreadId === "string") {
-          subagentParents.set(item.agentThreadId, activeThreadId!);
+        // An admitted child can announce its own children. Only retain new
+        // lineage from this turn's known tree; unrelated threads stay filtered
+        // above, and repeated/cyclic announcements cannot reparent an agent.
+        if (item.type === "subAgentActivity"
+            && typeof item.agentThreadId === "string"
+            && item.agentThreadId !== notificationThreadId
+            && item.agentThreadId !== activeThreadId
+            && !subagentParents.has(item.agentThreadId)) {
+          subagentParents.set(item.agentThreadId, notificationThreadId!);
         }
         if (isRootThread && item.type === "agentMessage" && typeof item.id === "string") {
           const messagePhase = item.phase;
@@ -1068,11 +1130,14 @@ export async function runCodexAppServerTurn(
       }
       : {
         threadId,
-        input: [{ type: "text", text: goal }],
+        input: [
+          { type: "text", text: goal },
+          ...existingAttachmentPaths(options.attachments, ["image"]).map((path) => ({ type: "localImage", path })),
+        ],
         cwd: options.workDir,
         ...(options.model ? { model: options.model } : {}),
         ...(options.effort ? { effort: options.effort } : {}),
-        ...(options.speed === "fast" ? { serviceTier: "fast" } : {}),
+        ...(options.speed ? { serviceTier: codexServiceTier(options.speed) } : {}),
         summary: "concise",
         approvalPolicy: options.approvalPolicy ?? "never",
       };

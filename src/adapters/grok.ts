@@ -39,9 +39,6 @@ export function buildGrokArgs(
     "streaming-json",
     "--permission-mode",
     permissionMode,
-    "--no-subagents",
-    "--no-memory",
-    "--disable-web-search",
   ];
   if (options.model) args.push("--model", options.model);
   if (options.effort) args.push("--reasoning-effort", options.effort);

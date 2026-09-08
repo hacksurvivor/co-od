@@ -1,3 +1,5 @@
+import { nativeImageAttachments } from "./native-images.js";
+import { managedIntegrationRuntime, type ManagedIntegrationRuntime } from "./managed-integrations.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -146,7 +148,7 @@ export const claudeBackgroundAgents = {
 
 export function buildClaudeArgs(
   goal: string,
-  options: Pick<ExecuteOptions, "attachments" | "effort" | "model" | "permissionMode" | "providerSession"> & { extraAddDirs?: string[]; providerNativeBrowser?: boolean } = {},
+  options: Pick<ExecuteOptions, "attachments" | "effort" | "model" | "permissionMode" | "providerSession"> & { extraAddDirs?: string[]; nativeInput?: boolean; providerNativeBrowser?: boolean; managedIntegrations?: ManagedIntegrationRuntime } = {},
 ): string[] {
   const permissionMode = {
     ask: "manual",
@@ -165,12 +167,8 @@ export function buildClaudeArgs(
     "--verbose",
     "--permission-mode",
     permissionMode,
-    // Native Chrome is enabled only after the room supervisor supplies a
-    // fresh parity proof. The ordinary room path remains explicitly isolated.
-    options.providerNativeBrowser ? "--chrome" : "--no-chrome",
-    "--disallowedTools",
-    "WebFetch,WebSearch",
   ];
+  if (options.providerNativeBrowser) args.push("--chrome");
   if (options.providerSession?.providerSessionId) {
     args.push("--resume", options.providerSession.providerSessionId);
     if (options.providerSession.mode === "fork") {
@@ -185,7 +183,9 @@ export function buildClaudeArgs(
   for (const dir of existingAttachmentPaths(options.attachments, ["directory"])) {
     args.push("--add-dir", dir);
   }
-  args.push("--", goal);
+  args.push(...(options.managedIntegrations?.claudeArguments ?? []));
+  if (options.nativeInput) args.push("--input-format", "stream-json");
+  else args.push("--", goal);
   return args;
 }
 
@@ -251,6 +251,7 @@ export function claudeSubagentActivities(
     }
     if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
       const description = labels.get(block.tool_use_id);
+      if (description === undefined) continue;
       const failed = block.is_error === true;
       activities.push({
         kind: "tool",
@@ -273,6 +274,56 @@ export function claudeSubagentActivities(
     }
   }
   return activities;
+}
+
+/** Tracks ordinary tool calls separately from Agent/Task lineage. */
+export class ClaudeTranscriptTracker {
+  private readonly tools = new Map<string, HarnessActivityUpdate>();
+  private readonly messages = new Map<string, string>();
+
+  messageID(payload: Record<string, unknown>): string | undefined {
+    const scope = typeof payload.parent_tool_use_id === "string" ? payload.parent_tool_use_id : "root";
+    const event = payload.type === "stream_event" && payload.event && typeof payload.event === "object"
+      ? payload.event as Record<string, unknown> : payload;
+    if (event.type === "message_start" && event.message && typeof event.message === "object") {
+      const id = (event.message as Record<string, unknown>).id;
+      if (typeof id === "string") this.messages.set(scope, id);
+    }
+    return this.messages.get(scope);
+  }
+
+  activities(payload: Record<string, unknown>): HarnessActivityUpdate[] {
+    if (payload.type !== "assistant" && payload.type !== "user") return [];
+    const message = payload.message && typeof payload.message === "object" ? payload.message as Record<string, unknown> : payload;
+    const activities: HarnessActivityUpdate[] = [];
+    for (const value of Array.isArray(message.content) ? message.content : []) {
+      if (!value || typeof value !== "object") continue;
+      const block = value as Record<string, unknown>;
+      if (block.type === "tool_use" && typeof block.id === "string" && typeof block.name === "string" && !/^(?:Agent|Task)$/i.test(block.name)) {
+        if (this.tools.has(block.id)) continue;
+        const input = block.input && typeof block.input === "object" ? block.input as Record<string, unknown> : {};
+        const command = typeof input.command === "string" ? input.command : undefined;
+        const shell = block.name === "Bash";
+        const activity: HarnessActivityUpdate = {
+          kind: shell ? "command" : block.name === "Read" ? "read" : /^(Grep|Glob)$/.test(block.name) ? "search" : "tool",
+          phase: "started", title: shell ? "Running command" : `Using ${block.name}`,
+          detail: command || (typeof input.file_path === "string" ? input.file_path : block.name),
+          tool: block.name, input: boundedActivityPayload(input), codeLanguage: shell ? "shell" : "json",
+        };
+        this.tools.set(block.id, activity);
+        activities.push(activity);
+      } else if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+        const started = this.tools.get(block.tool_use_id);
+        if (!started) continue;
+        this.tools.delete(block.tool_use_id);
+        const failed = block.is_error === true;
+        const artifacts = harnessArtifactsFromToolResult(block.content, { provider: "claude", tool: started.tool!, title: started.title });
+        activities.push({ ...started, phase: "completed", title: failed ? `Failed ${started.tool}` : started.tool === "Bash" ? "Ran command" : `Used ${started.tool}`,
+          result: failed ? "Failed" : "Completed", output: boundedActivityPayload(block.content), ...(artifacts.length ? { artifacts } : {}) });
+      }
+    }
+    return activities;
+  }
 }
 
 export function parseClaudePrintOutput(stdout: string): { text: string; providerSessionId?: string } {
@@ -314,10 +365,10 @@ type ClaudePersistentOptions = Pick<
   ExecuteOptions,
   "effort" | "model" | "permissionMode" | "providerSession" | "signal" |
   "onActivity" | "onOutput" | "onTextDelta" | "onRawEvent"
-> & { workDir: string; providerNativeBrowser?: boolean };
+> & { workDir: string; providerNativeBrowser?: boolean; managedIntegrations?: ManagedIntegrationRuntime };
 
 export function buildClaudePersistentArgs(
-  options: Pick<ClaudePersistentOptions, "effort" | "model" | "permissionMode" | "providerSession" | "providerNativeBrowser">,
+  options: Pick<ClaudePersistentOptions, "effort" | "model" | "permissionMode" | "providerSession" | "providerNativeBrowser" | "managedIntegrations">,
 ): string[] {
   const args = [
     "-p",
@@ -329,23 +380,25 @@ export function buildClaudePersistentArgs(
     "--replay-user-messages",
     "--verbose",
     "--permission-mode", claudeForegroundPermissionMode(options.permissionMode),
-    options.providerNativeBrowser ? "--chrome" : "--no-chrome",
-    "--disallowedTools", "WebFetch,WebSearch",
   ];
+  if (options.providerNativeBrowser) args.push("--chrome");
   if (options.providerSession?.providerSessionId) {
     args.push("--resume", options.providerSession.providerSessionId);
     if (options.providerSession.mode === "fork") args.push("--fork-session");
   }
   if (options.model) args.push("--model", options.model);
   if (options.effort) args.push("--effort", options.effort);
+  args.push(...(options.managedIntegrations?.claudeArguments ?? []));
   return args;
 }
 
-const claudeUserInput = (goal: string, sessionID?: string): string => JSON.stringify({
+export const claudeUserInput = (goal: string, sessionID?: string, images: Awaited<ReturnType<typeof nativeImageAttachments>> = []): string => JSON.stringify({
   type: "user",
   message: {
     role: "user",
-    content: [{ type: "text", text: goal }],
+    content: [{ type: "text", text: goal }, ...images.map((image) => ({
+      type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data },
+    }))],
   },
   parent_tool_use_id: null,
   ...(sessionID ? { session_id: sessionID } : {}),
@@ -371,6 +424,7 @@ class ClaudePersistentProcess {
   private closed = false;
   private idleTimer?: NodeJS.Timeout;
   private readonly subagentLabels = new Map<string, string>();
+  private transcriptTracker = new ClaudeTranscriptTracker();
   providerSessionID?: string;
 
   constructor(
@@ -423,6 +477,7 @@ class ClaudePersistentProcess {
       return Promise.resolve({ exitCode: 130, stdout: "", stderr: "Claude turn was cancelled." });
     }
     if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.transcriptTracker = new ClaudeTranscriptTracker();
     return new Promise<ExecuteResult>((resolve, reject) => {
       const pending: PendingClaudeTurn = {
         options,
@@ -489,13 +544,15 @@ class ClaudePersistentProcess {
     for (const activity of claudeSubagentActivities(payload, this.subagentLabels)) {
       pending.options.onActivity?.(activity);
     }
+    for (const activity of this.transcriptTracker.activities(payload)) pending.options.onActivity?.(activity);
+    const messageID = this.transcriptTracker.messageID(payload);
     const delta = claudeTextDelta(payload);
     if (delta) {
       pending.receivedTextDelta = true;
       pending.streamedText += delta;
       const parentToolUseID = typeof payload.parent_tool_use_id === "string"
         ? payload.parent_tool_use_id : undefined;
-      pending.options.onTextDelta?.(delta, parentToolUseID ? {
+      pending.options.onTextDelta?.(delta, messageID ? { messageID, ...(parentToolUseID ? { phase: "commentary" as const } : {}) } : parentToolUseID ? {
         messageID: `subagent:${parentToolUseID}`,
         phase: "commentary",
       } : undefined);
@@ -587,6 +644,7 @@ class ClaudePersistentSessionPool {
       effort: options.effort || "",
       permissionMode: options.permissionMode || "ask",
       nativeBrowser: options.providerNativeBrowser === true,
+      integrations: options.managedIntegrations?.signature,
     });
     const requestedSessionID = options.providerSession?.mode === "continue"
       ? options.providerSession.providerSessionId
@@ -645,11 +703,16 @@ export class ClaudeAdapter implements AgentAdapter {
     return which("claude");
   }
 
+  dispose(): void {
+    disposeClaudePersistentSessions();
+  }
+
   async execute(
     goal: string,
     options: ExecuteOptions
   ): Promise<ExecuteResult> {
     const { workDir, onOutput, signal } = options;
+    const managedIntegrations = managedIntegrationRuntime("claude");
 
     // Generate hooks config if room context is available
     let hooksDir: string | null = null;
@@ -676,7 +739,9 @@ export class ClaudeAdapter implements AgentAdapter {
       options.browserAccess,
       options.browserProviderParity,
     ) === "providerNative";
+    const images = await nativeImageAttachments(options.attachments);
     const args = buildClaudeArgs(providerGoal, {
+      nativeInput: images.length > 0,
       attachments: options.attachments,
       effort: options.effort,
       model: options.model,
@@ -684,6 +749,7 @@ export class ClaudeAdapter implements AgentAdapter {
       providerSession: options.providerSession,
       extraAddDirs,
       providerNativeBrowser,
+      managedIntegrations,
     });
 
     // Claude's documented stream-json input keeps one foreground process
@@ -704,6 +770,7 @@ export class ClaudeAdapter implements AgentAdapter {
         permissionMode: options.permissionMode,
         providerSession: options.providerSession,
         providerNativeBrowser,
+        managedIntegrations,
         signal,
         onActivity: options.onActivity,
         onOutput,
@@ -727,12 +794,13 @@ export class ClaudeAdapter implements AgentAdapter {
 
       // A piped stdin reads as prompt input — close it immediately or the
       // provider waits for EOF ("reading additional input from stdin").
-      child.stdin?.end();
+      child.stdin?.end(images.length ? `${claudeUserInput(providerGoal, options.providerSession?.providerSessionId, images)}\n` : undefined);
 
       let stdout = "";
       let stderr = "";
       let receivedTextDelta = false;
       const subagentLabels = new Map<string, string>();
+      const transcriptTracker = new ClaudeTranscriptTracker();
 
       child.stdout?.setEncoding("utf-8");
       child.stderr?.setEncoding("utf-8");
@@ -752,13 +820,15 @@ export class ClaudeAdapter implements AgentAdapter {
           for (const activity of claudeSubagentActivities(payload, subagentLabels)) {
             options.onActivity?.(activity);
           }
+          for (const activity of transcriptTracker.activities(payload)) options.onActivity?.(activity);
+          const messageID = transcriptTracker.messageID(payload);
           const delta = claudeTextDelta(payload);
           if (delta) {
             receivedTextDelta = true;
             const parentToolUseID = typeof payload.parent_tool_use_id === "string"
               ? payload.parent_tool_use_id
               : undefined;
-            options.onTextDelta?.(delta, parentToolUseID ? {
+            options.onTextDelta?.(delta, messageID ? { messageID, ...(parentToolUseID ? { phase: "commentary" as const } : {}) } : parentToolUseID ? {
               messageID: `subagent:${parentToolUseID}`,
               phase: "commentary",
             } : undefined);

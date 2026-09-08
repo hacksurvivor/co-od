@@ -26,7 +26,7 @@ test("Codex receives native, schema-constrained workspace and document tools", (
     "delete_automation", "list_tasks", "read_task", "create_task",
     "send_message", "rename_task", "pin_task", "archive_task",
     "unarchive_task", "fork_task",
-    "list_documents", "read_document", "propose_document",
+    "list_documents", "create_document", "read_document", "propose_document",
   ]);
   assert.equal(namespace.tools.find((tool) => tool.name === "create_automation")
     .inputSchema.properties.schedule.additionalProperties, false);

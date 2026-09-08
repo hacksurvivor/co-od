@@ -157,6 +157,15 @@ export const WORKSPACE_TOOL_DEFINITIONS: WorkspaceToolDefinition[] = [
     inputSchema: objectSchema({}),
   },
   {
+    name: "create_document",
+    description: "Create a new shared co·work draft. This does not approve or deliver it. Use propose_document for changes to an existing document.",
+    inputSchema: objectSchema({
+      title: string("First line naming the document."),
+      body: string("Draft body in paragraphs."),
+      space_id: string("Stable Space ID, when known. Omit for Room-wide Docs."),
+    }, ["title"]),
+  },
+  {
     name: "read_document",
     description: "Read one co·work Doc with its stable paragraph block IDs before proposing changes. This is read-only.",
     inputSchema: objectSchema({
@@ -226,7 +235,7 @@ export const promptWithWorkspaceAccess = (
     invocation,
     "Automation tools: create_automation, list_automations, update_automation, pause_automation, resume_automation, run_automation, delete_automation.",
     "Task tools: list_tasks, read_task, create_task, send_message, rename_task, pin_task, archive_task, unarchive_task, fork_task.",
-    "Document tools: list_documents and read_document are read-only; propose_document creates a reviewable paragraph proposal and never writes agreed document text.",
+    "Document tools: list_documents and read_document are read-only; create_document creates a shared draft; propose_document creates a reviewable paragraph proposal and never writes agreed document text.",
     "Do not turn an ordinary coding request into an automation or another task. Do not guess an omitted time, timezone, destination task, or harness; ask the user when the choice is material.",
     "Creating, updating, pausing, resuming, pinning, archiving, and forking are reflected in co·ode immediately. Archive is reversible.",
     "Never print, copy, log, or expose CO_OD_WORKSPACE_* environment values or capabilities.",

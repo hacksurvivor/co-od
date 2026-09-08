@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+import { nativeImageAttachments } from "./native-images.js";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
@@ -38,11 +40,9 @@ export function buildPiRpcArgs(
   if (sessionID) {
     args.push(options.providerSession?.mode === "fork" ? "--fork" : "--session", sessionID);
   }
-  // Pi has no generic built-in tool approval callback. An ask/custom/plan turn
-  // therefore starts without tools; claiming interactive approval here would
-  // silently grant more authority than the user selected.
-  if (["ask", "custom", "plan"].includes(options.permissionMode || "ask")) {
-    args.push("--no-tools");
+  if (options.permissionMode !== "fullAccess") {
+    args.push("--extension", fileURLToPath(new URL("./pi-permission-extension.js", import.meta.url)),
+      "--coode-permission-mode", options.permissionMode || "ask");
   }
   return args;
 }
@@ -212,6 +212,7 @@ export class PiAdapter implements AgentAdapter {
         stderr: "Pi CLI was not found. Install @earendil-works/pi-coding-agent, then reopen co·ode.",
       };
     }
+    const images = await nativeImageAttachments(options.attachments);
     const child = spawn(executable, buildPiRpcArgs(options), {
       cwd: options.workDir,
       env: providerProcessEnvironment({ ...options, provider: this.name }),
@@ -481,6 +482,7 @@ export class PiAdapter implements AgentAdapter {
         id: "coode-prompt",
         type: "prompt",
         message: promptWithHarnessCapabilities(prompt, options, this.name),
+        ...(images.length ? { images } : {}),
       });
       write({ id: "coode-commands", type: "get_commands" });
       options.onRuntimeControl?.({

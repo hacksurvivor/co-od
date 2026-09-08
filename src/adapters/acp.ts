@@ -1,3 +1,4 @@
+import { nativeImageAttachments } from "./native-images.js";
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import {
@@ -41,12 +42,15 @@ export interface AcpAgentCommand {
   executable: string;
   args: string[];
   harness: string;
+  newSessionParameters?: Record<string, unknown>;
+  stopSessionOnCancel?: boolean;
 }
 
 interface AcpSessionSetup {
   sessionID: string;
   modes?: SessionModeState | null;
   configOptions?: SessionConfigOption[] | null;
+  models?: { currentModelId: string; availableModels: Array<{ modelId: string; name: string; _meta?: { reasoningEfforts?: Array<{ id: string; value?: string; label?: string }> } }> };
 }
 
 interface ObservedAcpFeatures {
@@ -281,7 +285,21 @@ export function acpNativeSessionMode(
   })?.id;
 
   if (permissionMode === "plan") return find(["plan"]);
-  if (harness.toLowerCase() !== "grok") return undefined;
+  if (harness.toLowerCase() !== "grok") {
+    if (harness.toLowerCase() === "gemini") {
+      if (permissionMode === "fullAccess") return find(["yolo"]);
+      if (permissionMode === "approve") return find(["auto_edit"]);
+      if (permissionMode === "ask" || permissionMode === "custom") return find(["default"]);
+    }
+    if (harness.toLowerCase() === "hermes") {
+      if (permissionMode === "approve") return find(["accept_edits"]);
+      if (permissionMode === "fullAccess") return find(["dont_ask"]);
+      if (permissionMode === "ask" || permissionMode === "custom") return find(["default"]);
+    }
+    // Resume out of a previously selected native Plan mode when the user changes modes.
+    if (permissionMode && normalizedModeName(modes.currentModeId) === "plan") return find(["build", "code", "edit", "default"]);
+    return undefined;
+  }
 
   switch (permissionMode) {
     case "approve":
@@ -298,7 +316,7 @@ export function acpNativeSessionMode(
   }
 }
 
-async function configureSession(
+export async function configureSession(
   context: ClientContext,
   session: AcpSessionSetup,
   options: ExecuteOptions,
@@ -327,27 +345,72 @@ async function configureSession(
     }
   }
 
+  if (!session.modes) {
+    const modeConfig = session.configOptions?.find((candidate) => candidate.type === "select" && candidate.category === "mode");
+    if (modeConfig?.type === "select") {
+      const requested = acpNativeSessionMode(harness, options.permissionMode, {
+        currentModeId: modeConfig.currentValue,
+        availableModes: flattenSelectOptions(modeConfig).map((entry) => ({ id: entry.value, name: entry.name })),
+      });
+      if (requested && requested !== modeConfig.currentValue) {
+        const updated = await context.request(methods.agent.session.setConfigOption, {
+          sessionId: session.sessionID, configId: modeConfig.id, value: requested,
+        });
+        if (updated.configOptions) session.configOptions = updated.configOptions;
+      }
+    } else if (harness.toLowerCase() === "grok" && options.permissionMode) {
+      // Installed Grok versions expose native Plan through set_mode without a modes catalog.
+      await context.request(methods.agent.session.setMode, {
+        sessionId: session.sessionID, modeId: options.permissionMode === "plan" ? "plan" : "default",
+      });
+    }
+  }
+
   const desired = [
-    { value: options.model, categories: ["model", "model_config"], labels: /model/i },
-    { value: options.effort, categories: ["thought_level"], labels: /(?:effort|reason|thought)/i },
+    { kind: "model", value: options.model, category: "model", labels: /^(?:model|models)$/i },
+    { kind: "reasoning effort", value: options.effort, category: "thought_level", labels: /(?:effort|reason|thought)/i },
   ];
   for (const target of desired) {
     if (!target.value) continue;
-    const config = session.configOptions?.find((candidate) =>
-      candidate.type === "select"
-      && (target.categories.includes(candidate.category || "") || target.labels.test(`${candidate.id} ${candidate.name}`))
-    );
-    if (!config) continue;
-    const match = flattenSelectOptions(config).find((candidate) =>
-      candidate.value.toLowerCase() === target.value!.toLowerCase()
-      || candidate.name.toLowerCase() === target.value!.toLowerCase()
-    );
-    if (!match || match.value === config.currentValue) continue;
-    await context.request(methods.agent.session.setConfigOption, {
+    if (target.kind === "reasoning effort" && harness.toLowerCase() === "grok" && session.models
+      && !session.configOptions?.some((candidate) => candidate.category === "thought_level")) {
+      const current = session.models.availableModels.find((candidate) => candidate.modelId === session.models!.currentModelId);
+      const selected = current?._meta?.reasoningEfforts?.find((candidate) => candidate.id === target.value || candidate.value === target.value);
+      if (!selected || !current) throw new Error(`Grok did not advertise the selected reasoning effort: ${target.value}.`);
+      await context.request("session/set_model", {
+        sessionId: session.sessionID, modelId: current.modelId, _meta: { reasoningEffort: selected.value ?? selected.id },
+      });
+      continue;
+    }
+    const selects = session.configOptions?.filter((candidate) => candidate.type === "select") ?? [];
+    // model_config also covers context size and speed; it is not a model selector.
+    const config = selects.find((candidate) => candidate.category === target.category)
+      ?? selects.find((candidate) => target.labels.test(candidate.id) || target.labels.test(candidate.name));
+    if (!config) {
+      // Older installed agents still advertise the former native model API.
+      if (target.kind === "model" && session.models) {
+        const selected = session.models.availableModels.find((candidate) =>
+          candidate.modelId === target.value || candidate.name.toLowerCase() === target.value!.toLowerCase());
+        if (!selected) throw new Error(`${harness} did not advertise the selected model: ${target.value}.`);
+        if (selected.modelId !== session.models.currentModelId) {
+          await context.request("session/set_model", { sessionId: session.sessionID, modelId: selected.modelId });
+        }
+        session.models.currentModelId = selected.modelId;
+        continue;
+      }
+      throw new Error(`${harness} does not expose ${target.kind} selection for this session; the requested ${target.value} was not applied.`);
+    }
+    const match = flattenSelectOptions(config).find((candidate) => candidate.value === target.value)
+      ?? flattenSelectOptions(config).find((candidate) => candidate.name.toLowerCase() === target.value!.toLowerCase());
+    if (!match) throw new Error(`${harness} did not advertise the selected ${target.kind}: ${target.value}.`);
+    if (match.value === config.currentValue) continue;
+    const updated = await context.request(methods.agent.session.setConfigOption, {
       sessionId: session.sessionID,
       configId: config.id,
       value: match.value,
     });
+    // Changing the model can change its effort choices. Use the provider's new catalog.
+    if (updated.configOptions) session.configOptions = updated.configOptions;
   }
 }
 
@@ -387,6 +450,7 @@ async function setupSession(
   context: ClientContext,
   capabilities: AgentCapabilities | undefined,
   options: ExecuteOptions,
+  newSessionParameters?: Record<string, unknown>,
 ): Promise<AcpSessionSetup> {
   const additionalDirectories = [...new Set(options.additionalDirectories || [])];
   const common = {
@@ -397,23 +461,23 @@ async function setupSession(
   const providerSession = options.providerSession;
   const source = providerSession?.providerSessionId;
   if (!source) {
-    const created = await context.request(methods.agent.session.new, common) as NewSessionResponse;
-    return { sessionID: created.sessionId, modes: created.modes, configOptions: created.configOptions };
+    const created = await context.request(methods.agent.session.new, { ...newSessionParameters, ...common }) as NewSessionResponse;
+    return { sessionID: created.sessionId, modes: created.modes, configOptions: created.configOptions, models: (created as typeof created & Pick<AcpSessionSetup, "models">).models };
   }
   if (providerSession.mode === "fork") {
     if (!capabilities?.sessionCapabilities?.fork) {
       throw new Error(`${providerSession.sourceRunId} cannot fork: the installed ACP agent did not advertise session/fork.`);
     }
     const forked = await context.request(methods.agent.session.fork, { sessionId: source, ...common }) as ForkSessionResponse;
-    return { sessionID: forked.sessionId, modes: forked.modes, configOptions: forked.configOptions };
+    return { sessionID: forked.sessionId, modes: forked.modes, configOptions: forked.configOptions, models: (forked as typeof forked & Pick<AcpSessionSetup, "models">).models };
   }
   if (capabilities?.sessionCapabilities?.resume) {
     const resumed = await context.request(methods.agent.session.resume, { sessionId: source, ...common }) as ResumeSessionResponse;
-    return { sessionID: source, modes: resumed.modes, configOptions: resumed.configOptions };
+    return { sessionID: source, modes: resumed.modes, configOptions: resumed.configOptions, models: (resumed as typeof resumed & Pick<AcpSessionSetup, "models">).models };
   }
   if (capabilities?.loadSession) {
     const loaded = await context.request(methods.agent.session.load, { sessionId: source, ...common }) as LoadSessionResponse;
-    return { sessionID: source, modes: loaded.modes, configOptions: loaded.configOptions };
+    return { sessionID: source, modes: loaded.modes, configOptions: loaded.configOptions, models: (loaded as typeof loaded & Pick<AcpSessionSetup, "models">).models };
   }
   throw new Error(`${providerSession.sourceRunId} cannot continue: the installed ACP agent advertised neither session/resume nor session/load.`);
 }
@@ -465,7 +529,7 @@ function processUpdate(
 }
 
 function closeCodeForStopReason(reason: string): number {
-  return reason === "end_turn" || reason === "max_tokens" || reason === "max_turn_requests" ? 0
+  return reason === "end_turn" ? 0
     : reason === "cancelled" ? 130
       : 1;
 }
@@ -520,10 +584,18 @@ export async function executeAcpAgent(
   let providerSessionId: string | undefined;
   let capabilityReceipt: HarnessCapabilityReceipt | undefined;
   let cancelActive: (() => Promise<void>) | undefined;
+  let promptInFlight = false;
+  let lastMessageID: string | undefined;
+  let toolSinceText = false;
   const appendText = (text: string, messageID?: string | null) => {
-    stdout += text;
-    options.onTextDelta?.(text, { messageID: messageID || undefined, phase: "assistant" });
-    options.onOutput?.(text);
+    const startsMessage = toolSinceText || (messageID && lastMessageID && messageID !== lastMessageID);
+    const delta = stdout && startsMessage && !stdout.endsWith("\n") && !text.startsWith("\n")
+      ? `\n\n${text}` : text;
+    stdout += delta;
+    toolSinceText = false;
+    lastMessageID = messageID || lastMessageID;
+    options.onTextDelta?.(delta, { messageID: messageID || undefined, phase: "assistant" });
+    options.onOutput?.(delta);
   };
   const app = client({ name: "co-ode" })
     .onRequest(methods.client.session.requestPermission, async ({ params }) => {
@@ -533,12 +605,16 @@ export async function executeAcpAgent(
       return response;
     })
     .onNotification(methods.client.session.update, ({ params }) => {
+      // session/load replays prior messages before its response. Those belong
+      // to retained history, not this attempt's text, activity, or token usage.
+      if (!promptInFlight) return;
+      if (params.update.sessionUpdate === "tool_call" && stdout) toolSinceText = true;
       raw("providerToCoode", { method: methods.client.session.update, params });
       processUpdate(params, options, command.harness, tools, observed, appendText);
     });
 
   const abort = () => {
-    void cancelActive?.();
+    void cancelActive?.().catch(() => {});
     setTimeout(() => {
       if (child.exitCode === null) child.kill("SIGTERM");
     }, 1_000).unref();
@@ -561,16 +637,24 @@ export async function executeAcpAgent(
       if (initialized.protocolVersion !== PROTOCOL_VERSION) {
         throw new Error(`Unsupported ACP protocol version ${initialized.protocolVersion}; co·ode supports ${PROTOCOL_VERSION}.`);
       }
-      const session = await setupSession(context, initialized.agentCapabilities, options);
+      const session = await setupSession(context, initialized.agentCapabilities, options, command.newSessionParameters);
       providerSessionId = session.sessionID;
-      cancelActive = () => context.notify(methods.agent.session.cancel, { sessionId: session.sessionID });
+      cancelActive = async () => {
+        if (command.stopSessionOnCancel) await context.request("session/stop", { sessionId: session.sessionID });
+        else await context.notify(methods.agent.session.cancel, { sessionId: session.sessionID });
+      };
       await configureSession(context, session, options, command.harness);
       const promptParams = {
         sessionId: session.sessionID,
-        prompt: [{ type: "text", text: prompt }],
+        prompt: [
+          { type: "text" as const, text: prompt },
+          ...(initialized.agentCapabilities?.promptCapabilities?.image ? await nativeImageAttachments(options.attachments) : []),
+        ],
       };
       raw("coodeToProvider", { method: methods.agent.session.prompt, params: promptParams });
+      promptInFlight = true;
       const response = await context.request(methods.agent.session.prompt, promptParams, { cancellationSignal: options.signal }) as PromptResponse;
+      promptInFlight = false;
       raw("providerToCoode", { method: methods.agent.session.prompt, result: response });
       if (response.usage) observed.usage = true;
       capabilityReceipt = receiptFor(command, initialized, observed);
@@ -589,7 +673,8 @@ export async function executeAcpAgent(
     return {
       exitCode: closeCodeForStopReason(response.stopReason),
       stdout,
-      stderr,
+      stderr: stderr || (["max_tokens", "max_turn_requests"].includes(response.stopReason)
+        ? `${command.harness} stopped at its native turn limit. Continue the saved session to finish.` : ""),
       providerSessionId,
       capabilityReceipt,
     };

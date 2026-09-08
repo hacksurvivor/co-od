@@ -20,10 +20,16 @@ function which(cmd: string): boolean {
 
 export function buildAntigravityArgs(
   goal: string,
-  options: Pick<ExecuteOptions, "attachments" | "model" | "providerSession"> = {},
+  options: Pick<ExecuteOptions, "additionalDirectories" | "attachments" | "effort" | "model" | "permissionMode" | "providerSession"> = {},
   structuredOutput = false,
 ): string[] {
-  const args = ["--sandbox", "--mode", "accept-edits"];
+  const args: string[] = [];
+  if (options.permissionMode === "fullAccess") args.push("--dangerously-skip-permissions");
+  else if (options.permissionMode === "plan") args.push("--sandbox", "--mode", "plan");
+  else if (options.permissionMode === "approve") args.push("--sandbox", "--mode", "accept-edits");
+  // Ask/custom inherit native approval behavior; never silently grant edit permission.
+  if (options.effort) args.push("--effort", options.effort);
+  for (const directory of [...new Set(options.additionalDirectories ?? [])]) args.push("--add-dir", directory);
   if (options.model) args.push("--model", options.model);
   if (options.providerSession?.providerSessionId) {
     args.push("--conversation", options.providerSession.providerSessionId);
@@ -161,6 +167,8 @@ export class AntigravityAdapter implements AgentAdapter {
     sessionResume: true,
     attachments: true,
     modelSelection: true,
+    effortSelection: true,
+    permissionSelection: true,
     browser: coodeIsolatedBrowser(),
   });
 

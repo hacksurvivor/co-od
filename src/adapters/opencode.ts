@@ -16,6 +16,7 @@ import { openCodeNativeSessionState } from "./opencode-server.js";
 const OPENCODE_BIN = process.env.OPENCODE_BIN || "opencode";
 
 function which(cmd: string): boolean {
+  if (cmd.includes("/")) return existsSync(cmd);
   const paths = (process.env.PATH || "").split(":");
   return paths.some((dir) => existsSync(`${dir}/${cmd}`));
 }

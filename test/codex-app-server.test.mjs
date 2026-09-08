@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   separateAppServerMessageDelta,
   translateAppServerItem,
+  codexActivityFromEvent,
 } from "../dist/adapters/codex.js";
 import {
   codexPermissionDecision,
@@ -287,6 +288,102 @@ test("Codex App Server forwards child-thread tools with durable parent lineage",
   );
 });
 
+for (const lifecycle of ["fresh", "prepared", "resumed", "forked"]) {
+  test(`Codex Standard clears Fast for a ${lifecycle} thread`, async () => {
+    let notification;
+    let tier = "fast"; // User configuration or the persisted conversation.
+    const requests = [];
+    const client = {
+      async ensureStarted() {},
+      isThreadActive() { return lifecycle === "prepared"; },
+      markThreadActive() {},
+      onNotification(handler) { notification = handler; return () => {}; },
+      onRequest() { return () => {}; },
+      async request(method, params) {
+        requests.push({ method, params });
+        if (Object.hasOwn(params, "serviceTier")) tier = params.serviceTier;
+        if (["thread/start", "thread/resume", "thread/fork"].includes(method)) {
+          return { thread: { id: "astra-thread" } };
+        }
+        if (method === "turn/start") {
+          setTimeout(() => notification("turn/completed", {
+            threadId: "astra-thread", turn: { id: "turn", status: "completed" },
+          }), 0);
+          return { turn: { id: "turn" } };
+        }
+        throw new Error(method);
+      },
+    };
+    if (lifecycle === "prepared") {
+      await prepareCodexAppServerThread({
+        client, workDir: "/workspace", model: "gpt-6-astra", speed: "fast",
+        waitForMcpStartup: false,
+      });
+      assert.equal(tier, "fast");
+    }
+    await runCodexAppServerTurn("Continue", {
+      client, workDir: "/workspace", model: "gpt-6-astra", effort: "ultra",
+      speed: "standard", turnTimeoutMs: 2_000,
+      ...(lifecycle !== "fresh" ? { threadId: "astra-thread" } : {}),
+      ...(lifecycle === "forked" ? { forkThread: true } : {}),
+    });
+    assert.equal(tier, "default");
+    const turn = requests.find(({ method }) => method === "turn/start").params;
+    assert.equal(turn.serviceTier, "default");
+    assert.equal(turn.model, "gpt-6-astra");
+    assert.equal(turn.effort, "ultra");
+    const setup = requests.filter(({ method }) => method !== "turn/start").at(-1)?.params;
+    assert.equal(setup?.serviceTier, lifecycle === "prepared" ? "fast" : "default");
+  });
+}
+
+test("Codex forwards nested agent activity without mixing unrelated threads or root output", async () => {
+  let notification;
+  const observed = [];
+  const deltas = [];
+  const client = {
+    async ensureStarted() {},
+    markThreadActive() {},
+    onNotification(handler) { notification = handler; return () => {}; },
+    onRequest() { return () => {}; },
+    async request(method) {
+      if (method === "thread/start") return { thread: { id: "root" } };
+      if (method === "turn/start") {
+        setTimeout(() => {
+          const started = (threadId, item) => notification("item/started", { threadId, item });
+          const agent = (id, agentThreadId) => ({ type: "subAgentActivity", id, agentThreadId, agentPath: `/root/${id}`, kind: "started" });
+          started("unrelated", agent("foreign", "foreign-child"));
+          started("root", agent("child", "child"));
+          started("child", agent("grandchild", "grandchild"));
+          started("grandchild", agent("cycle", "child"));
+          started("grandchild", { type: "commandExecution", id: "nested-command", command: "read fixture" });
+          started("child", { type: "commandExecution", id: "child-after-cycle", command: "read fixture" });
+          started("foreign-child", { type: "commandExecution", id: "foreign-command", command: "unrelated" });
+          notification("item/agentMessage/delta", { threadId: "grandchild", itemId: "child-answer", delta: "Private child progress" });
+          notification("item/completed", { threadId: "grandchild", item: { type: "agentMessage", id: "child-answer", text: "Child done", phase: "final_answer" } });
+          notification("turn/completed", { threadId: "grandchild", turn: { id: "child-turn", status: "completed" } });
+          notification("item/completed", { threadId: "root", item: { type: "agentMessage", id: "root-answer", text: "Root done", phase: "final_answer" } });
+          notification("turn/completed", { threadId: "root", turn: { id: "turn", status: "completed" } });
+        }, 0);
+        return { turn: { id: "turn" } };
+      }
+      throw new Error(method);
+    },
+  };
+  const result = await runCodexAppServerTurn("Inspect", {
+    client, workDir: "/workspace", model: "gpt-6-astra", effort: "ultra", turnTimeoutMs: 2_000,
+    onItem(item, phase, context) { observed.push({ id: item.id, context }); },
+    onDelta(text) { deltas.push(text); },
+  });
+  assert.deepEqual(observed.find(({ id }) => id === "nested-command")?.context, {
+    threadId: "grandchild", parentThreadId: "child", isSubagent: true,
+  });
+  assert.equal(observed.find(({ id }) => id === "child-after-cycle")?.context.parentThreadId, "root");
+  assert.equal(observed.some(({ id }) => id === "foreign-command"), false);
+  assert.deepEqual(deltas, []);
+  assert.equal(result.finalMessage, "Root done");
+});
+
 test("Codex App Server runs detached native review and returns review findings", async () => {
   let notification;
   const requests = [];
@@ -475,7 +572,10 @@ input.on("line", (line) => {
   });
   t.after(() => client.dispose());
   const approvals = [];
-  const result = await runCodexAppServerTurn("Run the tests", {
+  const result = await runCodexAppServerTurn("Проверь тесты проекта.", {
+    model: "gpt-6-astra",
+    attachments: [{ path: "screen.png", absolutePath: join(directory, "screen.png"), kind: "image", exists: true }],
+    effort: "xhigh",
     workDir: directory,
     client,
     approvalPolicy: "on-request",
@@ -498,6 +598,14 @@ input.on("line", (line) => {
     messages.find((message) => message.method === "turn/start")?.params?.approvalPolicy,
     "on-request",
   );
+  const nativeTurn = messages.find((message) => message.method === "turn/start").params;
+  assert.equal(nativeTurn.model, "gpt-6-astra");
+  assert.equal(nativeTurn.effort, "xhigh");
+  assert.deepEqual(nativeTurn.input, [{ type: "text", text: "Проверь тесты проекта." }, { type: "localImage", path: join(directory, "screen.png") }]);
+  const nativeThread = messages.find((message) => message.method === "thread/start").params;
+  assert.equal(nativeThread.model, "gpt-6-astra");
+  assert.equal(nativeThread.baseInstructions, undefined);
+  assert.equal(nativeThread.developerInstructions, undefined);
   assert.deepEqual(messages.find((message) => message.id === 701 && message.result), {
     jsonrpc: "2.0",
     id: 701,
@@ -875,7 +983,7 @@ test("translateAppServerItem maps app-server items to exec event shapes", () => 
   );
   assert.deepEqual(
     translateAppServerItem({ type: "fileChange", id: "i3", changes: [{ path: "a.ts" }] }),
-    { type: "item.completed", item: { type: "file_change", path: "a.ts" } },
+    { type: "item.completed", item: { type: "file_change", path: "a.ts", changes: [{ path: "a.ts" }] } },
   );
   assert.deepEqual(
     translateAppServerItem({
@@ -1194,4 +1302,19 @@ process.stdin.on("data", (chunk) => {
   // undefined, not [], so callers keep their built-in list instead of
   // rendering an empty picker.
   assert.equal(await readCodexModels(client), undefined);
+});
+
+test("file edits retain every provider diff through native activity translation", () => {
+  const changes = [
+    { path: "a.ts", kind: { type: "update" }, diff: "@@ -1 +1 @@\n-old\n+new" },
+    { path: "b.ts", kind: { type: "add" }, diff: "+another file" },
+  ];
+  const completed = translateAppServerItem({ type: "fileChange", changes });
+  assert.deepEqual(completed.item.changes, changes);
+  const activity = codexActivityFromEvent(completed);
+  assert.equal(activity.kind, "file");
+  assert.match(activity.output, /File: a\.ts\n@@ -1 \+1 @@\n-old\n\+new/);
+  assert.match(activity.output, /File: b\.ts\n\+another file/);
+  const started = codexActivityFromEvent(translateAppServerItem({ type: "fileChange", changes }, "started"));
+  assert.equal(started.output, undefined);
 });

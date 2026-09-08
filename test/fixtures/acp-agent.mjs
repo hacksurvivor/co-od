@@ -11,6 +11,9 @@ const modes = {
   availableModes: [
     { id: "edit", name: "Edit" },
     { id: "plan", name: "Plan" },
+    { id: "default", name: "Default" },
+    { id: "acceptEdits", name: "Accept Edits" },
+    { id: "bypassPermissions", name: "Bypass Permissions" },
   ],
 };
 
@@ -39,6 +42,11 @@ const configOptions = [
   },
 ];
 
+let selectedModel = "fixture-small";
+const sessionConfiguration = () => process.argv.includes("--legacy-models")
+  ? { models: { currentModelId: selectedModel, availableModels: [{ modelId: "fixture-small", name: "Fixture Small" }, { modelId: "fixture-large", name: "Fixture Large" }] } }
+  : { configOptions };
+
 const fixture = agent({ name: "co-ode-acp-fixture" })
   .onRequest(methods.agent.initialize, ({ params }) => ({
     protocolVersion: params.protocolVersion === PROTOCOL_VERSION ? PROTOCOL_VERSION : params.protocolVersion,
@@ -51,7 +59,7 @@ const fixture = agent({ name: "co-ode-acp-fixture" })
         delete: {},
         additionalDirectories: {},
         fork: {},
-        resume: {},
+        ...(process.argv.includes("--load-only") ? {} : { resume: {} }),
         close: {},
       },
       providers: {},
@@ -60,18 +68,34 @@ const fixture = agent({ name: "co-ode-acp-fixture" })
   .onRequest(methods.agent.session.new, () => ({
     sessionId: "acp-session-new",
     modes,
-    configOptions,
+    ...sessionConfiguration(),
   }))
-  .onRequest(methods.agent.session.load, () => ({ modes, configOptions }))
+  .onRequest(methods.agent.session.load, async ({ params, client }) => {
+    await client.notify(methods.client.session.update, {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Prior answer replay" },
+      },
+    });
+    return { modes, configOptions };
+  })
   .onRequest(methods.agent.session.resume, () => ({ modes, configOptions }))
   .onRequest(methods.agent.session.fork, () => ({
     sessionId: "acp-session-fork",
     modes,
     configOptions,
   }))
+  .onRequest("session/set_model", { parse: value => value }, ({ params }) => { selectedModel = params.modelId; return {}; })
   .onRequest(methods.agent.session.setMode, () => ({}))
   .onRequest(methods.agent.session.setConfigOption, () => ({ configOptions }))
   .onRequest(methods.agent.session.prompt, async ({ params, client }) => {
+    if (process.argv.includes("--message-boundaries")) {
+      for (const text of ["Preparing", " the edit."]) await client.notify(methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+      });
+    }
     await client.notify(methods.client.session.update, {
       sessionId: params.sessionId,
       update: {
@@ -130,7 +154,7 @@ const fixture = agent({ name: "co-ode-acp-fixture" })
       update: {
         sessionUpdate: "agent_message_chunk",
         messageId: "message-1",
-        content: { type: "text", text: "ACP ready" },
+        content: { type: "text", text: process.argv.includes("--legacy-models") ? selectedModel : "ACP ready" },
       },
     });
     await client.notify(methods.client.session.update, {
@@ -142,8 +166,12 @@ const fixture = agent({ name: "co-ode-acp-fixture" })
         cost: { amount: 0.01, currency: "USD" },
       },
     });
+    if (process.argv.includes("--message-boundaries")) await client.notify(methods.client.session.update, {
+      sessionId: params.sessionId,
+      update: { sessionUpdate: "agent_message_chunk", messageId: "message-2", content: { type: "text", text: "Finished." } },
+    });
     return {
-      stopReason: "end_turn",
+      stopReason: process.argv.includes("--token-limit") ? "max_tokens" : "end_turn",
       usage: { totalTokens: 10, inputTokens: 6, outputTokens: 4 },
     };
   });

@@ -16,7 +16,7 @@ importers:
         version: 0.3.0(typescript@5.9.3)(web-tree-sitter@0.25.10)
       '@opentui/react':
         specifier: 0.3.0
-        version: 0.3.0(react-devtools-core@7.0.1)(react@19.2.8)(typescript@5.9.3)(web-tree-sitter@0.25.10)(ws@8.21.3)
+        version: 0.3.0(react-devtools-core@7.0.1)(react@19.2.8)(typescript@5.9.3)(web-tree-sitter@0.25.10)(ws@8.21.0)
       convex:
         specifier: 1.32.0
         version: 1.32.0(react@19.2.8)
@@ -30,8 +30,8 @@ importers:
         specifier: 0.25.10
         version: 0.25.10
       ws:
-        specifier: ^8.18.0
-        version: 8.21.3
+        specifier: 8.21.0
+        version: 8.21.0
     devDependencies:
       '@types/node':
         specifier: ^22.10.2
@@ -420,8 +420,8 @@ packages:
       utf-8-validate:
         optional: true
 
-  ws@8.21.3:
-    resolution: {integrity: sha512-201TZ/kPWxoPr/OKWjquZR1SWKXcvxdH+e1xrx89b3YbmzLMFCLfnaG1HFIgWzJOEWZ7MvpK++odZufgYR50Rw==}
+  ws@8.21.0:
+    resolution: {integrity: sha512-Vsp28b7DRcimFQvrqu2Wek3z1iYxDCWqHYB8Qsnk/S4RfaCQzPGPyBNuVjJV3cd6UiKtUtp6sNM77gWvzcCH+g==}
     engines: {node: '>=10.0.0'}
     peerDependencies:
       bufferutil: ^4.0.1
@@ -563,13 +563,13 @@ snapshots:
     transitivePeerDependencies:
       - typescript
 
-  '@opentui/react@0.3.0(react-devtools-core@7.0.1)(react@19.2.8)(typescript@5.9.3)(web-tree-sitter@0.25.10)(ws@8.21.3)':
+  '@opentui/react@0.3.0(react-devtools-core@7.0.1)(react@19.2.8)(typescript@5.9.3)(web-tree-sitter@0.25.10)(ws@8.21.0)':
     dependencies:
       '@opentui/core': 0.3.0(typescript@5.9.3)(web-tree-sitter@0.25.10)
       react: 19.2.8
       react-devtools-core: 7.0.1
       react-reconciler: 0.33.0(react@19.2.8)
-      ws: 8.21.3
+      ws: 8.21.0
     transitivePeerDependencies:
       - typescript
       - web-tree-sitter
@@ -715,7 +715,7 @@ snapshots:
 
   ws@8.18.0: {}
 
-  ws@8.21.3: {}
+  ws@8.21.0: {}
 
   wsl-utils@0.1.0:
     dependencies:

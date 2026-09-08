@@ -109,7 +109,8 @@ const artifactID = (
   tool: options.tool,
   uri: options.uri,
   mediaType,
-  content: content?.slice(0, 4_096),
+  content,
+  context: options.context,
   index,
 })).digest("hex").slice(0, 32);
 
@@ -140,8 +141,14 @@ export const harnessArtifactFromResource = (
   const encoding = text !== undefined ? "utf8" as const
     : blob !== undefined ? "base64" as const : undefined;
   const kind = options.forceKind || harnessArtifactKind(mediaType);
+  let context = options.context;
+  if (resource._meta) {
+    try {
+      context = harnessArtifactContext({ ...(context ? JSON.parse(context) : {}), resourceMeta: resource._meta });
+    } catch { /* Invalid context remains unavailable. */ }
+  }
   return {
-    id: artifactID({ ...options, uri }, mediaType, content, index),
+    id: artifactID({ ...options, uri, context }, mediaType, content, index),
     kind,
     title,
     mediaType,
@@ -149,7 +156,7 @@ export const harnessArtifactFromResource = (
     ...(uri ? { uri } : {}),
     ...(content !== undefined ? { content } : {}),
     ...(encoding ? { encoding } : {}),
-    ...(options.context ? { context: options.context } : {}),
+    ...(context ? { context } : {}),
     ...(options.displayMode ? { displayMode: options.displayMode } : {}),
     ...(options.interactive !== undefined ? { interactive: options.interactive } : {}),
     provider: options.provider,
@@ -257,7 +264,7 @@ export const harnessArtifactsFromToolResult = (
       const mediaType = String(item.mimeType || "application/octet-stream").slice(0, 160);
       const isMCPApp = isMCPAppResource(mediaType, uri, advertisedURI);
       artifacts.push({
-        id: artifactID({ ...options, uri }, mediaType, undefined, index),
+        id: artifactID({ ...options, uri, context }, mediaType, undefined, index),
         kind: isMCPApp ? "mcpApp" : "link",
         title: linkTitle,
         mediaType,

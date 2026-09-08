@@ -28,6 +28,17 @@ export function buildZeroClawAcpArgs(): string[] {
   return ["acp"];
 }
 
+/** Select only an explicit alias or an unambiguous native configuration. */
+export function zeroClawAgentAlias(config: unknown, explicit = process.env.ZEROCLAW_AGENT_ALIAS): string {
+  if (explicit?.trim()) return explicit.trim();
+  const value = config && typeof config === "object" ? (config as { value?: unknown }).value : undefined;
+  const aliases = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
+  if (aliases.length === 1) return aliases[0]!;
+  throw new Error(aliases.length
+    ? "ZeroClaw has multiple configured agents. Select one with ZEROCLAW_AGENT_ALIAS before starting this agent."
+    : "ZeroClaw requires a configured agent alias. Configure a native ZeroClaw agent before starting it in co·od.");
+}
+
 const zeroClawNativeControls: HarnessNativeControlService = {
   async snapshot(context) {
     const [version, runtime, estop, autonomy] = await Promise.all([
@@ -131,8 +142,19 @@ export class ZeroClawAdapter implements AgentAdapter {
   }
 
   async execute(goal: string, options: ExecuteOptions): Promise<ExecuteResult> {
+    let agentAlias: string;
+    try {
+      let config: unknown;
+      if (!process.env.ZEROCLAW_AGENT_ALIAS?.trim()) {
+        const result = await runNativeControlCommand(ZEROCLAW_BIN, ["config", "get", "agents", "--json"], options.workDir);
+        if (result.exitCode === 0) config = JSON.parse(result.stdout);
+      }
+      agentAlias = zeroClawAgentAlias(config);
+    } catch (error) {
+      return { exitCode: 78, stdout: "", stderr: error instanceof Error ? error.message : "ZeroClaw agent configuration is unavailable." };
+    }
     return executeAcpAgent(
-      { executable: ZEROCLAW_BIN, args: buildZeroClawAcpArgs(), harness: this.name },
+      { executable: ZEROCLAW_BIN, args: buildZeroClawAcpArgs(), harness: this.name, newSessionParameters: { agentAlias }, stopSessionOnCancel: true },
       promptWithHarnessCapabilities(goal, options, this.name),
       options,
     );

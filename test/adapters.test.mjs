@@ -37,6 +37,10 @@ import {
   codexDisplayStdout,
 } from "../dist/adapters/codex.js";
 import {
+  codexExecutableCandidates,
+  resolveCodexExecutable,
+} from "../dist/adapters/codex-executable.js";
+import {
   buildCustomHarnessArgs,
   customHarnessManifestPayload,
   verifyCustomHarnessAttestation,
@@ -94,6 +98,35 @@ const browserAccess = {
 
 const acpFixture = fileURLToPath(new URL("./fixtures/acp-agent.mjs", import.meta.url));
 const piRpcFixture = fileURLToPath(new URL("./fixtures/pi-rpc-agent.mjs", import.meta.url));
+
+test("Codex resolution includes Finder-safe well-known installations", () => {
+  const environment = {
+    HOME: "/Users/example",
+    PATH: "/usr/bin:/bin",
+  };
+  const candidates = codexExecutableCandidates(environment);
+  assert.ok(candidates.includes("/Users/example/.npm-global/bin/codex"));
+  assert.ok(candidates.includes("/Applications/ChatGPT.app/Contents/Resources/codex"));
+  assert.equal(
+    resolveCodexExecutable(
+      environment,
+      (candidate) => candidate === "/Users/example/.npm-global/bin/codex",
+    ),
+    "/Users/example/.npm-global/bin/codex",
+  );
+});
+
+test("Codex resolution honors an explicit executable before PATH candidates", () => {
+  const environment = {
+    COODE_CODEX_EXECUTABLE_PATH: "/private/provider/codex",
+    HOME: "/Users/example",
+    PATH: "/usr/bin:/bin",
+  };
+  assert.equal(
+    resolveCodexExecutable(environment, () => true),
+    "/private/provider/codex",
+  );
+});
 
 test("channel-capable ACP harnesses elevate outbound actions to explicit external grants", () => {
   const outbound = {
@@ -248,6 +281,39 @@ test("shared ACP transport negotiates, streams structured activity, and returns 
   assert.equal(result.capabilityReceipt.capabilities.usageReporting, true);
 });
 
+test("ACP continuation excludes session-load history from the new answer and stream", async () => {
+  const text = [];
+  const raw = [];
+  const result = await executeAcpAgent(
+    { executable: process.execPath, args: [acpFixture, "--load-only"], harness: "fixture" },
+    "Continue",
+    {
+      workDir: process.cwd(),
+      permissionMode: "approve",
+      providerSession: { mode: "continue", sourceRunId: "run-a", providerSessionId: "loaded-session" },
+      onTextDelta: (chunk) => text.push(chunk),
+      onRawEvent: (event) => raw.push(event),
+    },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.providerSessionId, "loaded-session");
+  assert.equal(result.stdout, "ACP ready");
+  assert.equal(text.join(""), "ACP ready");
+  assert.doesNotMatch(JSON.stringify(raw), /Prior answer replay/);
+});
+
+test("ACP separates messages around tools while preserving chunks within a message", async () => {
+  const text = [];
+  const result = await executeAcpAgent(
+    { executable: process.execPath, args: [acpFixture, "--message-boundaries"], harness: "fixture" },
+    "Edit",
+    { workDir: process.cwd(), permissionMode: "approve", onTextDelta: (chunk) => text.push(chunk) },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "Preparing the edit.\n\nACP ready\n\nFinished.");
+  assert.equal(text.join(""), result.stdout);
+});
+
 test("OpenClaw and ZeroClaw are separate ACP adapters", () => {
   assert.equal(getAdapter("openclaw").name, "openclaw");
   assert.equal(getAdapter("zeroclaw").name, "zeroclaw");
@@ -255,8 +321,10 @@ test("OpenClaw and ZeroClaw are separate ACP adapters", () => {
   assert.deepEqual(buildZeroClawAcpArgs(), ["acp"]);
 });
 
-test("Pi RPC arguments preserve sessions and fail closed without a tool approval bridge", () => {
-  assert.deepEqual(buildPiRpcArgs(), ["--mode", "rpc", "--no-tools"]);
+test("Pi RPC arguments preserve native tools with the selected approval extension", () => {
+  const extension = decodeURIComponent(new URL("../dist/adapters/pi-permission-extension.js", import.meta.url).pathname);
+  assert.deepEqual(buildPiRpcArgs(), ["--mode", "rpc", "--extension", extension, "--coode-permission-mode", "ask"]);
+  assert.deepEqual(buildPiRpcArgs({ permissionMode: "fullAccess" }), ["--mode", "rpc"]);
   assert.deepEqual(buildPiRpcArgs({
     model: "openai/gpt-5.6",
     effort: "high",
@@ -267,11 +335,12 @@ test("Pi RPC arguments preserve sessions and fail closed without a tool approval
     "--model", "openai/gpt-5.6",
     "--thinking", "high",
     "--session", "pi-session-a",
+    "--extension", extension, "--coode-permission-mode", "approve",
   ]);
   assert.deepEqual(buildPiRpcArgs({
     permissionMode: "plan",
     providerSession: { mode: "fork", sourceRunId: "run-a", providerSessionId: "pi-session-a" },
-  }), ["--mode", "rpc", "--fork", "pi-session-a", "--no-tools"]);
+  }), ["--mode", "rpc", "--fork", "pi-session-a", "--extension", extension, "--coode-permission-mode", "plan"]);
 });
 
 test("Pi extension dialogs map to typed approvals and exact RPC responses", () => {
@@ -359,7 +428,8 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(piRpcFixture)}
     assert.match(usage.output, /\[redacted\]/);
     assert.doesNotMatch(usage.output, /must-redact/);
     assert.deepEqual((await readFile(argumentsPath, "utf8")).trim().split("\n"), [
-      "--mode", "rpc", "--no-tools",
+      "--mode", "rpc", "--extension", decodeURIComponent(new URL("../dist/adapters/pi-permission-extension.js", import.meta.url).pathname),
+      "--coode-permission-mode", "plan",
     ]);
   } finally {
     process.env.PATH = previousPath;
@@ -930,7 +1000,8 @@ test("provider processes retain provider auth but never inherit relay authority 
 test("browser prompt contract is opt-in, semantic, and never embeds authority", () => {
   assert.equal(promptWithBrowserAccess("Inspect the app"), "Inspect the app");
   const prompt = promptWithBrowserAccess("Inspect the app", browserAccess);
-  assert.match(prompt, /use only co-ode's isolated browser/i);
+  assert.match(prompt, /additional Room-scoped browser/i);
+  assert.match(prompt, /native tools, web search, integrations, and task workflow remain available/);
   assert.match(prompt, /\$CO_OD_BROWSER_TOOL/);
   assert.match(prompt, /setViewport, navigate, assertVisible, assertText, click, fill, screenshot/);
   assert.match(prompt, /"width":390,"height":844/);
@@ -939,11 +1010,8 @@ test("browser prompt contract is opt-in, semantic, and never embeds authority", 
   assert.match(prompt, /"expected":"Example Domain"/);
   assert.match(prompt, /assertText also requires an `expected` string/);
   assert.match(prompt, /status live region normally uses .*"role":"status".* without a name/);
-  assert.match(prompt, /absolute URL and semantic label.*authoritative/i);
-  assert.match(prompt, /No CO_OD_\* environment variable contains a project preview URL/);
-  assert.match(prompt, /never substitute an environment variable or guess another port/);
-  assert.match(prompt, /Do not start, restart, or stop a preview server unless the task explicitly asks/);
-  assert.match(prompt, /submit the complete requested sequence once/);
+  assert.match(prompt, /actual project URL and accessible element labels/);
+  assert.doesNotMatch(prompt, /use only|Do not use a provider-native|Do not start, restart|sequence once|guess another port/i);
   assert.match(prompt, /<task>\nInspect the app\n<\/task>/);
   assert.doesNotMatch(prompt, /scoped-browser-capability/);
   assert.doesNotMatch(prompt, /https:\/\/relay\.example\.test/);
@@ -963,7 +1031,7 @@ test("provider-native browser mode requires a fresh complete proof and otherwise
   )), "coodeIsolated");
 
   const prompt = promptWithBrowserAccess("Inspect the app", browserAccess, "claude", parity);
-  assert.match(prompt, /provider-native browser tools/i);
+  assert.match(prompt, /provider-native browser integration/i);
   assert.doesNotMatch(prompt, /\$CO_OD_BROWSER_TOOL/);
 
   const environment = providerProcessEnvironment({
@@ -992,9 +1060,6 @@ test("buildClaudeArgs passes model and readable directories natively", () => {
       "--verbose",
       "--permission-mode",
       "acceptEdits",
-      "--no-chrome",
-      "--disallowedTools",
-      "WebFetch,WebSearch",
       "--model",
       "sonnet",
       "--add-dir",
@@ -1011,6 +1076,19 @@ test("buildClaudeArgs enables Chrome only after provider parity was verified by 
   const args = buildClaudeArgs("Inspect", { providerNativeBrowser: true });
   assert.ok(args.includes("--chrome"));
   assert.ok(!args.includes("--no-chrome"));
+});
+
+test("Claude and Grok retain native tools, integrations, memory, and delegation", () => {
+  for (const args of [buildClaudeArgs("Помоги с проектом"), buildClaudePersistentArgs({}), buildGrokArgs("Помоги с проектом")]) {
+    assert.ok(!args.some((arg) => ["--disallowedTools", "--no-chrome", "--no-subagents", "--no-memory", "--disable-web-search"].includes(arg)));
+  }
+  for (const provider of ["codex", "claude", "grok", "gemini", "opencode", "hermes", "pi", "openclaw", "zeroclaw", "antigravity"]) {
+    const request = "Сделай трекер походов на Python без внешних библиотек.";
+    assert.equal(promptWithBrowserAccess(request, undefined, provider), request);
+    const wrapped = promptWithBrowserAccess(request, browserAccess, provider);
+    assert.ok(wrapped.includes(request));
+    assert.doesNotMatch(wrapped, /respond in English|answer in English|Do not use a provider-native/i);
+  }
 });
 
 test("buildClaudeArgs resumes or forks known provider sessions", () => {
@@ -1033,9 +1111,6 @@ test("buildClaudeArgs resumes or forks known provider sessions", () => {
       "--verbose",
       "--permission-mode",
       "acceptEdits",
-      "--no-chrome",
-      "--disallowedTools",
-      "WebFetch,WebSearch",
       "--resume",
       "claude-session-a",
       "--fork-session",
@@ -1231,6 +1306,15 @@ input.on("line", (line) => {
   assert.equal(new Set(entries.map((entry) => entry.pid)).size, 1);
   assert.equal(entries.filter((entry) => entry.input).length, 2);
   assert.equal(entries.find((entry) => entry.args)?.args.includes("--replay-user-messages"), true);
+  const providerPID = entries[0].pid;
+  adapter.dispose();
+  const isAlive = () => {
+    try { process.kill(providerPID, 0); return true; }
+    catch (error) { if (error.code === "ESRCH") return false; throw error; }
+  };
+  const deadline = Date.now() + 2_000;
+  while (isAlive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(isAlive(), false, "disposing an attempt must release the persistent Claude process");
 });
 
 test("Claude background-agent service lists, dispatches, and controls the native lifecycle", async (t) => {
@@ -1343,6 +1427,15 @@ test("buildCodexArgs maps fast speed to Codex service tier", () => {
       "Fix issue",
     ],
   );
+});
+
+test("buildCodexArgs explicitly clears inherited Fast only when Standard is selected", () => {
+  for (const providerSession of [undefined, { mode: "continue", sourceRunId: "run-a", providerSessionId: "astra-thread" }]) {
+    const args = buildCodexArgs("Continue", { model: "gpt-6-astra", speed: "standard", providerSession });
+    assert.ok(args.includes('service_tier="default"'));
+    assert.equal(args[args.indexOf('service_tier="default"') - 1], "--config");
+    assert.equal(buildCodexArgs("Continue", { providerSession }).some((arg) => arg.startsWith("service_tier=")), false);
+  }
 });
 
 test("buildCodexArgs resumes known provider sessions", () => {
@@ -1557,7 +1650,7 @@ process.on("SIGTERM", () => server.close(() => process.exit(0)));
   assert.ok(getHarnessCapabilities("opencode").checkpointing);
 });
 
-test("buildAntigravityArgs uses native sandboxed print mode and resumes known conversations", () => {
+test("buildAntigravityArgs inherits native permissions and resumes known conversations", () => {
   assert.deepEqual(buildAntigravityArgs("Continue the change", {
     attachments,
     model: "gemini-3.5-flash",
@@ -1567,9 +1660,6 @@ test("buildAntigravityArgs uses native sandboxed print mode and resumes known co
       providerSessionId: "agy-conversation-a",
     },
   }), [
-    "--sandbox",
-    "--mode",
-    "accept-edits",
     "--model",
     "gemini-3.5-flash",
     "--conversation",
@@ -1638,9 +1728,6 @@ printf '%s\\n' 'Resume with: agy --conversation agy-conversation-a' >&2
     assert.equal(result.capabilityReceipt?.source, "declared");
     assert.equal(result.capabilityReceipt?.harness, "antigravity");
     assert.deepEqual((await readFile(argumentsPath, "utf8")).trim().split("\n"), [
-      "--sandbox",
-      "--mode",
-      "accept-edits",
       "--print",
       "Continue",
     ]);
@@ -1755,9 +1842,6 @@ test("buildGrokArgs preserves the native headless harness and isolated edit perm
       "streaming-json",
       "--permission-mode",
       "acceptEdits",
-      "--no-subagents",
-      "--no-memory",
-      "--disable-web-search",
       "--model",
       "grok-code-fast-1",
     ],

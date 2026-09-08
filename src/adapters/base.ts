@@ -591,6 +591,8 @@ export type HarnessArtifactKind =
  * into shared event metadata.
  */
 export interface HarnessArtifactUpdate {
+  /** Opaque reference to a private origin binding on the producing Mac. */
+  runtimeBindingID?: string;
   id: string;
   kind: HarnessArtifactKind;
   title: string;
@@ -699,10 +701,8 @@ export function promptWithBrowserAccess(
   if (mode === "providerNative") {
     return [
       "<co-ode-browser>",
-      "Use the provider-native browser tools for this turn. co·ode verified a fresh parity proof for the room-scoped isolated context.",
-      "Use semantic targets only. Do not access another browser profile, extension, tab, context, or credential store.",
-      "External writes and destructive actions still require co·ode confirmation receipts.",
-      "Record test steps and artifact receipts so room collaborators can inspect the result.",
+      "co·od has verified the provider-native browser integration for this Room’s isolated context.",
+      "Actions in that Room context use its scoped permissions and confirmation receipts.",
       "</co-ode-browser>",
       "",
       "<task>",
@@ -712,17 +712,15 @@ export function promptWithBrowserAccess(
   }
   return [
     "<co-ode-browser>",
-    "For browser work in this room, use only co-ode's isolated browser through $CO_OD_BROWSER_TOOL.",
-    "Do not use a provider-native browser, web-search tool, browser extension, MCP browser, or a user's browser profile.",
+    "An additional Room-scoped browser is available through $CO_OD_BROWSER_TOOL for shared browser work and inspectable artifacts.",
+    "Your native tools, web search, integrations, and task workflow remain available under the permissions selected by the user.",
     "Run semantic steps by piping JSON on stdin, for example:",
     `printf '%s' '{"steps":[{"kind":"setViewport","width":390,"height":844},{"kind":"navigate","url":"https://example.com"},{"kind":"assertVisible","target":{"by":"role","role":"heading","name":"Example Domain"}},{"kind":"assertText","target":{"by":"role","role":"heading","name":"Example Domain"},"expected":"Example Domain"},{"kind":"screenshot"}]}' | "$CO_OD_BROWSER_TOOL" run`,
-    "Allowed step kinds: setViewport, navigate, assertVisible, assertText, click, fill, screenshot.",
+    "This tool accepts step kinds: setViewport, navigate, assertVisible, assertText, click, fill, screenshot.",
     "setViewport accepts integer width and height values from 240 through 3840, so responsive layouts can be checked without using a personal browser.",
-    "Use semantic targets only. Every target requires a `by` discriminator: {\"by\":\"role\",\"role\":\"heading\",\"name\":\"...\"}, {\"by\":\"label\",\"text\":\"...\"}, {\"by\":\"text\",\"text\":\"...\"}, or {\"by\":\"testId\",\"value\":\"...\"}. assertText also requires an `expected` string. Arbitrary scripts and coordinate clicks are not available.",
+    "For this tool, use semantic targets only. Every target requires a `by` discriminator: {\"by\":\"role\",\"role\":\"heading\",\"name\":\"...\"}, {\"by\":\"label\",\"text\":\"...\"}, {\"by\":\"text\",\"text\":\"...\"}, or {\"by\":\"testId\",\"value\":\"...\"}. assertText also requires an `expected` string. This tool does not expose arbitrary scripts or coordinate clicks.",
     "For assertText, the target only identifies the element and `expected` contains the text to verify. A status live region normally uses {\"by\":\"role\",\"role\":\"status\"} without a name; add `name` only when it is the element's actual accessible name. Use `exact:false` only for an intentional partial accessible-name match.",
-    "Treat every absolute URL and semantic label in the task as authoritative: copy them literally into the requested steps. No CO_OD_* environment variable contains a project preview URL, so never substitute an environment variable or guess another port.",
-    "Do not start, restart, or stop a preview server unless the task explicitly asks you to. If the requested browser run fails, report its safe error and failed step instead of changing the server lifecycle or inventing alternate targets.",
-    "When the task requests one browser run, submit the complete requested sequence once; do not silently change accessible names or assertions between retries.",
+    "Pass the actual project URL and accessible element labels to this tool; its environment variables contain connection credentials, not the project preview URL.",
     `Download a returned artifact with: "$CO_OD_BROWSER_TOOL" artifact ARTIFACT_ID`,
     "Never print, copy, log, or expose browser environment variables or capabilities.",
     "</co-ode-browser>",
