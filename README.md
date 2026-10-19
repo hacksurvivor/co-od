@@ -82,3 +82,7 @@ Authentication tokens are read at runtime and must never be committed. See
 ## License
 
 The CLI source in this repository is available under the [MIT License](LICENSE).
+
+## Author
+
+Made by [Sergey Moloman](https://moloman.dev), AI product engineer.
